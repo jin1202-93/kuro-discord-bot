@@ -1,38 +1,38 @@
-CREATE TABLE IF NOT EXISTS public.kuro_auth_codes (
+CREATE TABLE IF NOT EXISTS public.kuro_auth_codes_v2 (
     code_hash text PRIMARY KEY,
-    discord_user_id text NOT NULL,
+    license_id text NOT NULL,
     expires_at timestamptz NOT NULL,
     used boolean NOT NULL DEFAULT false
 );
 
-CREATE TABLE IF NOT EXISTS public.kuro_auth_licenses (
-    discord_user_id text PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS public.kuro_auth_licenses_v2 (
+    license_id text PRIMARY KEY,
     device_id text,
     active boolean NOT NULL DEFAULT true,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public.kuro_auth_sessions (
+CREATE TABLE IF NOT EXISTS public.kuro_auth_sessions_v2 (
     token_hash text PRIMARY KEY,
-    discord_user_id text NOT NULL REFERENCES public.kuro_auth_licenses(discord_user_id),
+    license_id text NOT NULL REFERENCES public.kuro_auth_licenses_v2(license_id),
     device_id text NOT NULL,
     expires_at timestamptz NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS kuro_auth_sessions_user_idx
-    ON public.kuro_auth_sessions(discord_user_id);
+CREATE INDEX IF NOT EXISTS kuro_auth_sessions_v2_license_idx
+    ON public.kuro_auth_sessions_v2(license_id);
 
-ALTER TABLE public.kuro_auth_codes ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.kuro_auth_licenses ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.kuro_auth_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.kuro_auth_codes_v2 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.kuro_auth_licenses_v2 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.kuro_auth_sessions_v2 ENABLE ROW LEVEL SECURITY;
 
-REVOKE ALL ON public.kuro_auth_codes, public.kuro_auth_licenses, public.kuro_auth_sessions
+REVOKE ALL ON public.kuro_auth_codes_v2, public.kuro_auth_licenses_v2, public.kuro_auth_sessions_v2
     FROM anon, authenticated;
-GRANT ALL ON public.kuro_auth_codes, public.kuro_auth_licenses, public.kuro_auth_sessions
+GRANT ALL ON public.kuro_auth_codes_v2, public.kuro_auth_licenses_v2, public.kuro_auth_sessions_v2
     TO service_role;
 
-CREATE OR REPLACE FUNCTION public.register_auth_code(
-    p_discord_user_id text,
+CREATE OR REPLACE FUNCTION public.issue_auth_code_v2(
+    p_license_id text,
     p_code_hash text,
     p_expires_days integer
 )
@@ -46,13 +46,13 @@ BEGIN
         RAISE EXCEPTION 'AUTH_INVALID_EXPIRY';
     END IF;
 
-    DELETE FROM public.kuro_auth_codes
-    WHERE discord_user_id = p_discord_user_id AND NOT used;
+    INSERT INTO public.kuro_auth_licenses_v2(license_id)
+    VALUES (p_license_id);
 
-    INSERT INTO public.kuro_auth_codes(code_hash, discord_user_id, expires_at)
+    INSERT INTO public.kuro_auth_codes_v2(code_hash, license_id, expires_at)
     VALUES (
         p_code_hash,
-        p_discord_user_id,
+        p_license_id,
         now() + make_interval(days => p_expires_days)
     );
 EXCEPTION WHEN unique_violation THEN
@@ -60,7 +60,7 @@ EXCEPTION WHEN unique_violation THEN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION public.redeem_auth_code(
+CREATE OR REPLACE FUNCTION public.redeem_auth_code_v2(
     p_code_hash text,
     p_device_id text,
     p_token_hash text
@@ -71,11 +71,11 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 DECLARE
-    v_code public.kuro_auth_codes%ROWTYPE;
-    v_license public.kuro_auth_licenses%ROWTYPE;
+    v_code public.kuro_auth_codes_v2%ROWTYPE;
+    v_license public.kuro_auth_licenses_v2%ROWTYPE;
 BEGIN
     SELECT * INTO v_code
-    FROM public.kuro_auth_codes
+    FROM public.kuro_auth_codes_v2
     WHERE code_hash = p_code_hash AND NOT used AND expires_at > now()
     FOR UPDATE;
 
@@ -83,41 +83,40 @@ BEGIN
         RAISE EXCEPTION 'AUTH_INVALID_CODE';
     END IF;
 
-    PERFORM pg_advisory_xact_lock(hashtextextended(v_code.discord_user_id, 0));
+    PERFORM pg_advisory_xact_lock(hashtextextended(v_code.license_id, 0));
 
     SELECT * INTO v_license
-    FROM public.kuro_auth_licenses
-    WHERE discord_user_id = v_code.discord_user_id
+    FROM public.kuro_auth_licenses_v2
+    WHERE license_id = v_code.license_id
     FOR UPDATE;
 
     IF FOUND AND NOT v_license.active THEN
-        RAISE EXCEPTION 'AUTH_REVOKED';
+        RAISE EXCEPTION 'AUTH_LICENSE_REVOKED';
     END IF;
     IF FOUND AND v_license.device_id IS NOT NULL
        AND v_license.device_id <> p_device_id THEN
         RAISE EXCEPTION 'AUTH_DEVICE_MISMATCH';
     END IF;
 
-    INSERT INTO public.kuro_auth_licenses(discord_user_id, device_id, active)
-    VALUES (v_code.discord_user_id, p_device_id, true)
-    ON CONFLICT (discord_user_id) DO UPDATE
-        SET device_id = EXCLUDED.device_id, active = true;
+    UPDATE public.kuro_auth_licenses_v2
+    SET device_id = p_device_id
+    WHERE license_id = v_code.license_id;
 
-    UPDATE public.kuro_auth_codes SET used = true WHERE code_hash = p_code_hash;
+    UPDATE public.kuro_auth_codes_v2 SET used = true WHERE code_hash = p_code_hash;
 
-    INSERT INTO public.kuro_auth_sessions(token_hash, discord_user_id, device_id, expires_at)
+    INSERT INTO public.kuro_auth_sessions_v2(token_hash, license_id, device_id, expires_at)
     VALUES (
         p_token_hash,
-        v_code.discord_user_id,
+        v_code.license_id,
         p_device_id,
         now() + interval '30 days'
     );
 
-    RETURN v_code.discord_user_id;
+    RETURN v_code.license_id;
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION public.verify_auth_session(
+CREATE OR REPLACE FUNCTION public.verify_auth_session_v2(
     p_token_hash text,
     p_device_id text
 )
@@ -127,9 +126,9 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-    SELECT s.discord_user_id
-    FROM public.kuro_auth_sessions AS s
-    JOIN public.kuro_auth_licenses AS l USING (discord_user_id)
+    SELECT s.license_id
+    FROM public.kuro_auth_sessions_v2 AS s
+    JOIN public.kuro_auth_licenses_v2 AS l USING (license_id)
     WHERE s.token_hash = p_token_hash
       AND s.device_id = p_device_id
       AND s.expires_at > now()
@@ -137,53 +136,68 @@ AS $$
       AND l.active;
 $$;
 
-CREATE OR REPLACE FUNCTION public.reset_auth_device(p_discord_user_id text)
+CREATE OR REPLACE FUNCTION public.reset_auth_device_v2(
+    p_license_id text,
+    p_code_hash text,
+    p_expires_days integer
+)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-    UPDATE public.kuro_auth_licenses SET device_id = NULL
-    WHERE discord_user_id = p_discord_user_id;
-    DELETE FROM public.kuro_auth_sessions WHERE discord_user_id = p_discord_user_id;
-    DELETE FROM public.kuro_auth_codes WHERE discord_user_id = p_discord_user_id;
+    UPDATE public.kuro_auth_licenses_v2 SET device_id = NULL
+    WHERE license_id = p_license_id AND active;
+    IF NOT FOUND THEN
+        IF EXISTS (SELECT 1 FROM public.kuro_auth_licenses_v2 WHERE license_id = p_license_id) THEN
+            RAISE EXCEPTION 'AUTH_LICENSE_REVOKED';
+        END IF;
+        RAISE EXCEPTION 'AUTH_LICENSE_NOT_FOUND';
+    END IF;
+
+    DELETE FROM public.kuro_auth_sessions_v2 WHERE license_id = p_license_id;
+    DELETE FROM public.kuro_auth_codes_v2 WHERE license_id = p_license_id;
+    INSERT INTO public.kuro_auth_codes_v2(code_hash, license_id, expires_at)
+    VALUES (p_code_hash, p_license_id, now() + make_interval(days => p_expires_days));
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION public.revoke_auth_user(p_discord_user_id text)
+CREATE OR REPLACE FUNCTION public.revoke_auth_user_v2(p_license_id text)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-    INSERT INTO public.kuro_auth_licenses(discord_user_id, device_id, active)
-    VALUES (p_discord_user_id, NULL, false)
-    ON CONFLICT (discord_user_id) DO UPDATE SET active = false;
-    DELETE FROM public.kuro_auth_sessions WHERE discord_user_id = p_discord_user_id;
-    DELETE FROM public.kuro_auth_codes WHERE discord_user_id = p_discord_user_id;
+    UPDATE public.kuro_auth_licenses_v2 SET active = false
+    WHERE license_id = p_license_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'AUTH_LICENSE_NOT_FOUND';
+    END IF;
+    DELETE FROM public.kuro_auth_sessions_v2 WHERE license_id = p_license_id;
+    DELETE FROM public.kuro_auth_codes_v2 WHERE license_id = p_license_id;
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.register_auth_code(text, text, integer)
+REVOKE ALL ON FUNCTION public.issue_auth_code_v2(text, text, integer)
     FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.redeem_auth_code(text, text, text)
+REVOKE ALL ON FUNCTION public.redeem_auth_code_v2(text, text, text)
     FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.verify_auth_session(text, text)
+REVOKE ALL ON FUNCTION public.verify_auth_session_v2(text, text)
     FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.reset_auth_device(text)
+REVOKE ALL ON FUNCTION public.reset_auth_device_v2(text, text, integer)
     FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.revoke_auth_user(text)
+REVOKE ALL ON FUNCTION public.revoke_auth_user_v2(text)
     FROM PUBLIC, anon, authenticated;
 
-GRANT EXECUTE ON FUNCTION public.register_auth_code(text, text, integer)
+GRANT EXECUTE ON FUNCTION public.issue_auth_code_v2(text, text, integer)
     TO service_role;
-GRANT EXECUTE ON FUNCTION public.redeem_auth_code(text, text, text)
+GRANT EXECUTE ON FUNCTION public.redeem_auth_code_v2(text, text, text)
     TO service_role;
-GRANT EXECUTE ON FUNCTION public.verify_auth_session(text, text)
+GRANT EXECUTE ON FUNCTION public.verify_auth_session_v2(text, text)
     TO service_role;
-GRANT EXECUTE ON FUNCTION public.reset_auth_device(text)
+GRANT EXECUTE ON FUNCTION public.reset_auth_device_v2(text, text, integer)
     TO service_role;
-GRANT EXECUTE ON FUNCTION public.revoke_auth_user(text)
+GRANT EXECUTE ON FUNCTION public.revoke_auth_user_v2(text)
     TO service_role;

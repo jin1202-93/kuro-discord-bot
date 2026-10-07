@@ -9,6 +9,8 @@ import time
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / "auth.sqlite3"
 SESSION_DAYS = 30
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+LICENSE_ID_PATTERN = re.compile(r"[A-F0-9]{16}")
 
 
 def _database_path():
@@ -62,7 +64,7 @@ def _connection():
 
 def initialize_database():
     if _uses_supabase():
-        _get_supabase_client().table("kuro_auth_codes").select("code_hash").limit(0).execute()
+        _get_supabase_client().table("kuro_auth_codes_v2").select("code_hash").limit(0).execute()
         return
 
     with _connection() as connection:
@@ -70,24 +72,24 @@ def initialize_database():
             """
             CREATE TABLE IF NOT EXISTS auth_codes (
                 code_hash TEXT PRIMARY KEY,
-                discord_user_id TEXT NOT NULL,
+                license_id TEXT NOT NULL,
                 expires_at REAL NOT NULL,
                 used INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS licenses (
-                discord_user_id TEXT PRIMARY KEY,
+                license_id TEXT PRIMARY KEY,
                 device_id TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
-                discord_user_id TEXT NOT NULL,
+                license_id TEXT NOT NULL,
                 device_id TEXT NOT NULL,
                 expires_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS sessions_user_idx
-                ON sessions(discord_user_id);
+                ON sessions(license_id);
             """
         )
 
@@ -102,6 +104,10 @@ def _supabase_error(error):
         raise PermissionError("이 계정의 프로그램 사용 권한이 비활성화되었습니다.") from error
     if "AUTH_CODE_DUPLICATE" in message:
         raise ValueError("이미 등록된 코드입니다. 다른 코드를 사용하세요.") from error
+    if "AUTH_LICENSE_NOT_FOUND" in message:
+        raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.") from error
+    if "AUTH_LICENSE_REVOKED" in message:
+        raise PermissionError("이미 취소된 인증입니다. 새 코드를 발급하세요.") from error
     raise error
 
 
@@ -117,49 +123,56 @@ def _sha256(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def register_code(discord_user_id, code, expires_days=30):
-    code = code.strip().upper()
-    if not re.fullmatch(r"[A-Z0-9-]{16,64}", code):
-        raise ValueError("코드는 영문 대문자·숫자·하이픈으로 16~64자 입력하세요.")
+def _new_code():
+    characters = "".join(secrets.choice(CODE_ALPHABET) for _ in range(24))
+    return "-".join(characters[index:index + 4] for index in range(0, 24, 4))
+
+
+def _validate_license_id(license_id):
+    normalized = str(license_id).strip().upper()
+    if not LICENSE_ID_PATTERN.fullmatch(normalized):
+        raise ValueError("관리 ID는 발급 메시지에 표시된 16자리 영문/숫자 값이어야 합니다.")
+    return normalized
+
+
+def issue_code(expires_days=30):
     if not 1 <= expires_days <= 365:
         raise ValueError("코드 유효기간은 1~365일이어야 합니다.")
+
+    code = _new_code()
+    license_id = secrets.token_hex(8).upper()
+    code_hash = _sha256(code)
 
     if _uses_supabase():
         try:
             _get_supabase_client().rpc(
-                "register_auth_code",
+                "issue_auth_code_v2",
                 {
-                    "p_discord_user_id": str(discord_user_id),
-                    "p_code_hash": _sha256(code),
+                    "p_license_id": license_id,
+                    "p_code_hash": code_hash,
                     "p_expires_days": expires_days,
                 },
             ).execute()
         except Exception as error:
             _supabase_error(error)
-        return
+        return code, license_id
 
     now = time.time()
     with _connection() as connection:
         _begin_write(connection)
-        code_hash = _sha256(code)
-        existing_code = _execute(
-            connection,
-            "SELECT discord_user_id FROM auth_codes WHERE code_hash = ?",
-            (code_hash,),
-        ).fetchone()
-        if existing_code is not None:
-            raise ValueError("이미 등록된 코드입니다. 다른 코드를 사용하세요.")
         _execute(
             connection,
-            "DELETE FROM auth_codes WHERE discord_user_id = ? AND used = 0",
-            (str(discord_user_id),),
+            "INSERT INTO licenses(license_id, device_id, active, created_at) "
+            "VALUES (?, NULL, 1, ?)",
+            (license_id, now),
         )
         _execute(
             connection,
-            "INSERT INTO auth_codes(code_hash, discord_user_id, expires_at) "
+            "INSERT INTO auth_codes(code_hash, license_id, expires_at) "
             "VALUES (?, ?, ?)",
-            (code_hash, str(discord_user_id), now + expires_days * 24 * 60 * 60),
+            (code_hash, license_id, now + expires_days * 24 * 60 * 60),
         )
+    return code, license_id
 
 
 def redeem_code(code, device_id):
@@ -168,7 +181,7 @@ def redeem_code(code, device_id):
         token = secrets.token_urlsafe(32)
         try:
             result = _get_supabase_client().rpc(
-                "redeem_auth_code",
+                "redeem_auth_code_v2",
                 {
                     "p_code_hash": _sha256(code),
                     "p_device_id": device_id,
@@ -185,7 +198,7 @@ def redeem_code(code, device_id):
         _begin_write(connection)
         auth_code = _execute(
             connection,
-            "SELECT discord_user_id, expires_at, used FROM auth_codes "
+            "SELECT license_id, expires_at, used FROM auth_codes "
             "WHERE code_hash = ?",
             (_sha256(code),),
         ).fetchone()
@@ -194,8 +207,8 @@ def redeem_code(code, device_id):
 
         license_row = _execute(
             connection,
-            "SELECT device_id, active FROM licenses WHERE discord_user_id = ?",
-            (auth_code["discord_user_id"],),
+            "SELECT device_id, active FROM licenses WHERE license_id = ?",
+            (auth_code["license_id"],),
         ).fetchone()
         if license_row is not None and not license_row["active"]:
             raise PermissionError("이 계정의 프로그램 사용 권한이 비활성화되었습니다.")
@@ -210,10 +223,8 @@ def redeem_code(code, device_id):
 
         _execute(
             connection,
-            "INSERT INTO licenses(discord_user_id, device_id, active, created_at) "
-            "VALUES (?, ?, 1, ?) "
-            "ON CONFLICT(discord_user_id) DO UPDATE SET device_id = excluded.device_id",
-            (auth_code["discord_user_id"], device_id, now),
+            "UPDATE licenses SET device_id = ? WHERE license_id = ?",
+            (device_id, auth_code["license_id"]),
         )
         _execute(
             connection,
@@ -222,11 +233,11 @@ def redeem_code(code, device_id):
         )
         _execute(
             connection,
-            "INSERT INTO sessions(token_hash, discord_user_id, device_id, expires_at) "
+            "INSERT INTO sessions(token_hash, license_id, device_id, expires_at) "
             "VALUES (?, ?, ?, ?)",
             (
                 _sha256(token),
-                auth_code["discord_user_id"],
+                auth_code["license_id"],
                 device_id,
                 now + SESSION_DAYS * 24 * 60 * 60,
             ),
@@ -238,7 +249,7 @@ def verify_session(token, device_id):
     if _uses_supabase():
         try:
             result = _get_supabase_client().rpc(
-                "verify_auth_session",
+                "verify_auth_session_v2",
                 {
                     "p_token_hash": _sha256(token),
                     "p_device_id": device_id,
@@ -256,9 +267,9 @@ def verify_session(token, device_id):
         session = _execute(
             connection,
             """
-            SELECT sessions.discord_user_id
+            SELECT sessions.license_id
             FROM sessions
-            JOIN licenses USING(discord_user_id)
+            JOIN licenses USING(license_id)
             WHERE sessions.token_hash = ?
               AND sessions.device_id = ?
               AND sessions.expires_at > ?
@@ -269,15 +280,66 @@ def verify_session(token, device_id):
         ).fetchone()
     if session is None:
         return None
-    return session["discord_user_id"]
+    return session["license_id"]
 
 
-def reset_device(discord_user_id):
+def reset_device(license_id, expires_days=30):
+    license_id = _validate_license_id(license_id)
+    if not 1 <= expires_days <= 365:
+        raise ValueError("코드 유효기간은 1~365일이어야 합니다.")
+    code = _new_code()
+    code_hash = _sha256(code)
     if _uses_supabase():
         try:
             _get_supabase_client().rpc(
-                "reset_auth_device",
-                {"p_discord_user_id": str(discord_user_id)},
+                "reset_auth_device_v2",
+                {
+                    "p_license_id": license_id,
+                    "p_code_hash": code_hash,
+                    "p_expires_days": expires_days,
+                },
+            ).execute()
+        except Exception as error:
+            _supabase_error(error)
+        return code
+
+    with _connection() as connection:
+        _begin_write(connection)
+        license_row = _execute(
+            connection,
+            "SELECT active FROM licenses WHERE license_id = ?",
+            (license_id,),
+        ).fetchone()
+        if license_row is None:
+            raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.")
+        if not license_row["active"]:
+            raise PermissionError("이미 취소된 인증입니다. 새 코드를 발급하세요.")
+        _execute(connection, "UPDATE licenses SET device_id = NULL WHERE license_id = ?", (license_id,))
+        _execute(
+            connection,
+            "DELETE FROM sessions WHERE license_id = ?",
+            (license_id,),
+        )
+        _execute(
+            connection,
+            "DELETE FROM auth_codes WHERE license_id = ?",
+            (license_id,),
+        )
+        _execute(
+            connection,
+            "INSERT INTO auth_codes(code_hash, license_id, expires_at) VALUES (?, ?, ?)",
+            (code_hash, license_id, time.time() + expires_days * 24 * 60 * 60),
+        )
+    return code
+
+
+def revoke_user(license_id):
+    license_id = _validate_license_id(license_id)
+    if _uses_supabase():
+        try:
+            _get_supabase_client().rpc(
+                "revoke_auth_user_v2",
+                {"p_license_id": license_id},
             ).execute()
         except Exception as error:
             _supabase_error(error)
@@ -285,50 +347,20 @@ def reset_device(discord_user_id):
 
     with _connection() as connection:
         _begin_write(connection)
+        updated = _execute(
+            connection,
+            "UPDATE licenses SET active = 0 WHERE license_id = ?",
+            (license_id,),
+        )
+        if updated.rowcount == 0:
+            raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.")
         _execute(
             connection,
-            "UPDATE licenses SET device_id = NULL WHERE discord_user_id = ?",
-            (str(discord_user_id),),
+            "DELETE FROM sessions WHERE license_id = ?",
+            (license_id,),
         )
         _execute(
             connection,
-            "DELETE FROM sessions WHERE discord_user_id = ?",
-            (str(discord_user_id),),
-        )
-        _execute(
-            connection,
-            "DELETE FROM auth_codes WHERE discord_user_id = ?",
-            (str(discord_user_id),),
-        )
-
-
-def revoke_user(discord_user_id):
-    if _uses_supabase():
-        try:
-            _get_supabase_client().rpc(
-                "revoke_auth_user",
-                {"p_discord_user_id": str(discord_user_id)},
-            ).execute()
-        except Exception as error:
-            _supabase_error(error)
-        return
-
-    with _connection() as connection:
-        _begin_write(connection)
-        _execute(
-            connection,
-            "INSERT INTO licenses(discord_user_id, device_id, active, created_at) "
-            "VALUES (?, NULL, 0, ?) "
-            "ON CONFLICT(discord_user_id) DO UPDATE SET active = 0",
-            (str(discord_user_id), time.time()),
-        )
-        _execute(
-            connection,
-            "DELETE FROM sessions WHERE discord_user_id = ?",
-            (str(discord_user_id),),
-        )
-        _execute(
-            connection,
-            "DELETE FROM auth_codes WHERE discord_user_id = ?",
-            (str(discord_user_id),),
+            "DELETE FROM auth_codes WHERE license_id = ?",
+            (license_id,),
         )

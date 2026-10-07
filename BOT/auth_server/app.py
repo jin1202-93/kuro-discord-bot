@@ -81,10 +81,10 @@ def verify(request: VerifyRequest, authorization: str | None = Header(default=No
     token = authorization[7:].strip()
     if not token or len(token) > 256:
         raise HTTPException(status_code=401, detail="인증 정보가 올바르지 않습니다.")
-    discord_user_id = verify_session(token, request.device_id)
-    if discord_user_id is None:
+    license_id = verify_session(token, request.device_id)
+    if license_id is None:
         raise HTTPException(
             status_code=401,
             detail="인증이 만료되었거나 권한이 취소되었습니다. 디스코드에서 다시 인증하세요.",
         )
-    return {"authorized": True, "discord_user_id": discord_user_id}
+    return {"authorized": True, "license_id": license_id}

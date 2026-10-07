@@ -1,11 +1,14 @@
 import asyncio
+import logging
 import os
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from auth_server.database import register_code, reset_device, revoke_user
+from auth_server.database import issue_code, reset_device, revoke_user
+
+logger = logging.getLogger(__name__)
 
 
 class KuroAuthBot(commands.Bot):
@@ -26,55 +29,6 @@ def _has_role(interaction, role_id):
     return any(role.id == role_id for role in member_roles)
 
 
-class CodeRegistrationModal(discord.ui.Modal, title="인증 코드 등록"):
-    def __init__(self, bot, member, expires_days):
-        super().__init__()
-        self.bot = bot
-        self.member = member
-        self.expires_days = expires_days
-        self.code_input = discord.ui.TextInput(
-            label="직접 정한 인증 코드",
-            placeholder="영문 대문자·숫자·하이픈, 16~64자",
-            min_length=16,
-            max_length=64,
-            required=True,
-        )
-        self.add_item(self.code_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if interaction.guild_id != self.bot.guild_id:
-            await interaction.response.send_message(
-                "등록된 인증 서버에서만 사용할 수 있습니다.",
-                ephemeral=True,
-            )
-            return
-        is_admin = interaction.guild_permissions.administrator or _has_role(
-            interaction,
-            self.bot.admin_role_id,
-        )
-        if not is_admin:
-            await interaction.response.send_message(
-                "관리자만 인증 코드를 등록할 수 있습니다.",
-                ephemeral=True,
-            )
-            return
-        try:
-            await asyncio.to_thread(
-                register_code,
-                self.member.id,
-                str(self.code_input.value),
-                self.expires_days,
-            )
-        except ValueError as error:
-            await interaction.response.send_message(str(error), ephemeral=True)
-            return
-        await interaction.response.send_message(
-            f"{self.member.mention} 전용 코드 등록 완료. "
-            f"{self.expires_days}일 동안 유효합니다. 코드는 서버에 해시로 저장됩니다.",
-            ephemeral=True,
-        )
-
-
 def create_bot():
     token = (
         os.environ.get("DISCORD_BOT_TOKEN")
@@ -93,18 +47,10 @@ def create_bot():
     )
     guild = discord.Object(id=bot.guild_id)
 
-    @bot.tree.command(
-        name="registercode",
-        description="직접 정한 KURO HELPER 인증 코드를 등록합니다.",
-        guild=guild,
-    )
-    @app_commands.describe(
-        member="이 코드를 사용할 테스터",
-        expires_days="코드 유효기간(일, 1~365)",
-    )
-    async def registercode(
+    @bot.tree.command(name="issuecode", description="KURO HELPER 인증 코드를 발급합니다.", guild=guild)
+    @app_commands.describe(expires_days="인증 코드 유효기간(일, 1~365)")
+    async def issuecode(
         interaction: discord.Interaction,
-        member: discord.Member,
         expires_days: app_commands.Range[int, 1, 365] = 30,
     ):
         if interaction.guild_id != bot.guild_id:
@@ -119,12 +65,26 @@ def create_bot():
         )
         if not is_admin:
             await interaction.response.send_message(
-                "관리자만 인증 코드를 등록할 수 있습니다.",
+                "관리자만 인증 코드를 발급할 수 있습니다.",
                 ephemeral=True,
             )
             return
-        await interaction.response.send_modal(
-            CodeRegistrationModal(bot, member, expires_days)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            code, license_id = await asyncio.to_thread(issue_code, expires_days)
+        except Exception:
+            logger.exception("Failed to issue an authentication code")
+            await interaction.followup.send(
+                "인증 코드 발급에 실패했습니다. Render 로그를 확인하세요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"인증 코드 발급 완료 (유효기간 {expires_days}일)\n"
+            f"코드: `{code}`\n관리 ID: `{license_id}`\n"
+            "코드는 이 메시지를 볼 수 있는 관리자만 확인할 수 있습니다. "
+            "코드를 테스터에게 전달하고 관리 ID는 안전하게 보관하세요.",
+            ephemeral=True,
         )
 
     @bot.tree.command(
@@ -132,10 +92,14 @@ def create_bot():
         description="사용자의 등록 PC를 초기화합니다.",
         guild=guild,
     )
-    @app_commands.describe(member="등록 PC를 초기화할 사용자")
+    @app_commands.describe(
+        license_id="코드 발급 시 함께 표시된 관리 ID",
+        expires_days="새 인증 코드 유효기간(일, 1~365)",
+    )
     async def resetdevice(
         interaction: discord.Interaction,
-        member: discord.Member,
+        license_id: str,
+        expires_days: app_commands.Range[int, 1, 365] = 30,
     ):
         if interaction.guild_id != bot.guild_id:
             await interaction.response.send_message(
@@ -153,10 +117,19 @@ def create_bot():
                 ephemeral=True,
             )
             return
-        await asyncio.to_thread(reset_device, member.id)
-        await interaction.response.send_message(
-            f"{member.mention}의 등록 PC와 기존 인증을 초기화했습니다.\n"
-            "새 PC용 코드를 `/registercode`로 등록해 테스터에게 다시 전달하세요.",
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            code = await asyncio.to_thread(reset_device, license_id, expires_days)
+        except Exception:
+            logger.exception("Failed to reset an authentication license")
+            await interaction.followup.send(
+                "초기화에 실패했습니다. 관리 ID와 Render 로그를 확인하세요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            "기기 연결을 초기화했고 새 코드를 발급했습니다.\n"
+            f"새 코드: `{code}`\n관리 ID: `{license_id.upper()}`",
             ephemeral=True,
         )
 
@@ -165,10 +138,10 @@ def create_bot():
         description="사용자의 KURO HELPER 인증을 취소합니다.",
         guild=guild,
     )
-    @app_commands.describe(member="인증을 취소할 사용자")
+    @app_commands.describe(license_id="코드 발급 시 함께 표시된 관리 ID")
     async def revokeuser(
         interaction: discord.Interaction,
-        member: discord.Member,
+        license_id: str,
     ):
         if interaction.guild_id != bot.guild_id:
             await interaction.response.send_message(
@@ -186,9 +159,19 @@ def create_bot():
                 ephemeral=True,
             )
             return
-        await asyncio.to_thread(revoke_user, member.id)
-        await interaction.response.send_message(
-            f"{member.mention}의 KURO HELPER 인증을 취소했습니다.",
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await asyncio.to_thread(revoke_user, license_id)
+        except Exception:
+            logger.exception("Failed to revoke an authentication license")
+            await interaction.followup.send(
+                "인증 취소에 실패했습니다. 관리 ID와 Render 로그를 확인하세요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"관리 ID `{license_id.upper()}`의 인증을 취소했습니다. "
+            "실행 중인 앱은 다음 서버 확인 때 종료됩니다.",
             ephemeral=True,
         )
 
