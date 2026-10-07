@@ -29,6 +29,13 @@ def _has_role(interaction, role_id):
     return any(role.id == role_id for role in member_roles)
 
 
+def _is_admin(interaction, role_id):
+    guild_permissions = getattr(interaction.user, "guild_permissions", None)
+    return bool(
+        guild_permissions is not None and guild_permissions.administrator
+    ) or _has_role(interaction, role_id)
+
+
 def _expiry_text(expires_days):
     return "무제한" if expires_days == 0 else f"{expires_days}일"
 
@@ -81,11 +88,7 @@ def create_bot():
                 ephemeral=True,
             )
             return
-        is_admin = interaction.guild_permissions.administrator or _has_role(
-            interaction,
-            bot.admin_role_id,
-        )
-        if not is_admin:
+        if not _is_admin(interaction, bot.admin_role_id):
             await interaction.response.send_message(
                 "관리자만 인증 코드를 발급할 수 있습니다.",
                 ephemeral=True,
@@ -129,11 +132,7 @@ def create_bot():
                 ephemeral=True,
             )
             return
-        is_admin = interaction.guild_permissions.administrator or _has_role(
-            interaction,
-            bot.admin_role_id,
-        )
-        if not is_admin:
+        if not _is_admin(interaction, bot.admin_role_id):
             await interaction.response.send_message(
                 "관리자만 등록 PC를 초기화할 수 있습니다.",
                 ephemeral=True,
@@ -171,11 +170,7 @@ def create_bot():
                 ephemeral=True,
             )
             return
-        is_admin = interaction.guild_permissions.administrator or _has_role(
-            interaction,
-            bot.admin_role_id,
-        )
-        if not is_admin:
+        if not _is_admin(interaction, bot.admin_role_id):
             await interaction.response.send_message(
                 "관리자만 인증을 취소할 수 있습니다.",
                 ephemeral=True,

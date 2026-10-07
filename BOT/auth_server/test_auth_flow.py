@@ -3,11 +3,13 @@ from pathlib import Path
 import sqlite3
 import tempfile
 from threading import Event
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
 from core.auth_client import AuthenticationError, LicenseMonitor
+from auth_server.bot import _is_admin
 
 from auth_server.app import RedeemRequest, VerifyRequest, health_check, redeem, verify
 from auth_server.database import (
@@ -158,6 +160,27 @@ class AuthFlowTests(unittest.TestCase):
 
     def test_health_check(self):
         self.assertEqual(health_check(), {"ok": True})
+
+    def test_admin_check_reads_member_permissions_and_configured_role(self):
+        administrator = SimpleNamespace(
+            user=SimpleNamespace(
+                guild_permissions=SimpleNamespace(administrator=True),
+                roles=[],
+            )
+        )
+        role_admin = SimpleNamespace(
+            user=SimpleNamespace(
+                guild_permissions=SimpleNamespace(administrator=False),
+                roles=[SimpleNamespace(id=42)],
+            )
+        )
+        non_admin = SimpleNamespace(
+            user=SimpleNamespace(roles=[])
+        )
+
+        self.assertTrue(_is_admin(administrator, 42))
+        self.assertTrue(_is_admin(role_admin, 42))
+        self.assertFalse(_is_admin(non_admin, 42))
 
     def test_license_monitor_notifies_when_server_revokes_session(self):
         revoked = Event()
