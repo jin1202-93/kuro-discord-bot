@@ -1,0 +1,5 @@
+.env
+**/.env
+__pycache__/
+*.py[cod]
+BOT/auth_server/*.sqlite3
