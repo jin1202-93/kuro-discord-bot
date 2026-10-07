@@ -62,7 +62,7 @@ def _connection():
 
 def initialize_database():
     if _uses_supabase():
-        _get_supabase_client().table("auth_codes").select("code_hash").limit(0).execute()
+        _get_supabase_client().table("kuro_auth_codes").select("code_hash").limit(0).execute()
         return
 
     with _connection() as connection:
