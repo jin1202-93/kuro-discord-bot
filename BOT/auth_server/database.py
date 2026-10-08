@@ -147,6 +147,8 @@ def _supabase_error(error):
         raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.") from error
     if "AUTH_LICENSE_REVOKED" in message:
         raise PermissionError("이미 취소된 인증입니다. 새 코드를 발급하세요.") from error
+    if "AUTH_NO_ACTIVE_SESSION" in message:
+        raise ValueError("기한을 변경할 인증 세션이 없습니다. 해당 계정이 인증되었는지 확인하세요.") from error
     raise error
 
 
@@ -769,6 +771,48 @@ def reset_device(license_id, expires_days=30):
             ),
         )
     return code
+
+
+def set_license_session_expiry(license_id_or_nickname, expires_days):
+    if not 0 <= expires_days <= 365:
+        raise ValueError("이용 기한은 0(무제한)~365일이어야 합니다.")
+    license_id = resolve_license_id(license_id_or_nickname)
+    expires_at = (
+        None if expires_days == 0 else time.time() + expires_days * 24 * 60 * 60
+    )
+
+    if _uses_supabase():
+        try:
+            _get_supabase_client().rpc(
+                "set_auth_session_expiry_v2",
+                {
+                    "p_license_id": license_id,
+                    "p_expires_days": expires_days,
+                },
+            ).execute()
+        except Exception as error:
+            _supabase_error(error)
+        return license_id
+
+    with _connection() as connection:
+        _begin_write(connection)
+        license_row = _execute(
+            connection,
+            "SELECT active FROM licenses WHERE license_id = ?",
+            (license_id,),
+        ).fetchone()
+        if license_row is None:
+            raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.")
+        if not license_row["active"]:
+            raise PermissionError("인증이 취소된 계정입니다.")
+        updated = _execute(
+            connection,
+            "UPDATE sessions SET expires_at = ? WHERE license_id = ?",
+            (expires_at, license_id),
+        )
+        if updated.rowcount == 0:
+            raise ValueError("기한을 변경할 인증 세션이 없습니다. 해당 계정이 인증되었는지 확인하세요.")
+    return license_id
 
 
 def revoke_user(license_id):

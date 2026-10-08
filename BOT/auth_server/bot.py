@@ -13,6 +13,7 @@ from auth_server.database import (
     set_app_update,
     issue_code,
     reset_device,
+    set_license_session_expiry,
     revoke_user,
     resolve_license_id,
     set_license_nickname,
@@ -158,7 +159,7 @@ def create_bot():
     async def resetdevice(
         interaction: discord.Interaction,
         license_id: str,
-        expires_days: app_commands.Range[int, 0, 365] = 30,
+        expires_days: app_commands.Range[int, 0, 365],
     ):
         if interaction.guild_id != bot.guild_id:
             await interaction.response.send_message(
@@ -189,6 +190,56 @@ def create_bot():
         await interaction.followup.send(
             f"기기 연결을 초기화했고 유효기간 {_expiry_text(expires_days)} 새 코드를 발급했습니다.\n"
             f"새 코드: `{code}`\n관리 ID: `{license_id.upper()}`",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(
+        name="setlicenseexpiry",
+        description="이미 인증된 계정의 남은 이용 기한을 변경합니다.",
+        guild=guild,
+    )
+    @app_commands.describe(
+        license_id="관리 ID 또는 등록된 별명 (정확히 일치)",
+        expires_days="변경 후 남은 이용 기한(일, 0=무제한, 1~365)",
+    )
+    async def setlicenseexpiry(
+        interaction: discord.Interaction,
+        license_id: str,
+        expires_days: app_commands.Range[int, 0, 365],
+    ):
+        if interaction.guild_id != bot.guild_id:
+            await interaction.response.send_message(
+                "등록된 인증 서버에서만 사용할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        if not _is_admin(interaction, bot.admin_role_id):
+            await interaction.response.send_message(
+                "관리자만 인증 코드 유효기간을 변경할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            license_id = await asyncio.to_thread(
+                set_license_session_expiry,
+                license_id,
+                expires_days,
+            )
+        except (ValueError, PermissionError) as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        except Exception:
+            logger.exception("Failed to change a license session expiry")
+            await interaction.followup.send(
+                "이용 기한 변경에 실패했습니다. 관리 ID와 Render 로그를 확인하세요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"관리 ID `{license_id}`의 이용 기한을 "
+            f"{_expiry_text(expires_days)}으로 변경했습니다.\n"
+            "기한은 지금부터 계산되며 기기 연결과 인증 코드는 변경하지 않았습니다.",
             ephemeral=True,
         )
 

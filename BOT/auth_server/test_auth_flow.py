@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import time
+import zipfile
 from threading import Event
 from types import SimpleNamespace
 import unittest
@@ -16,8 +17,12 @@ from core.auth_client import (
     LicenseMonitor,
     license_tier_allows,
 )
-from core.app_updater import UpdateError, update_state
+from core.app_updater import UpdateError, _extract_package, update_state
+from core.equipment_window_controls import ensure_equipment_window_open
+from core.multi_character_tester import MultiCharacterTester
+from pynput.keyboard import Key
 from auth_server.bot import _is_admin, create_bot
+from ui.main_window import KuroHelper
 
 from auth_server.app import RedeemRequest, VerifyRequest, health_check, redeem, verify
 from auth_server.database import (
@@ -28,6 +33,7 @@ from auth_server.database import (
     get_license_status,
     issue_code,
     reset_device,
+    set_license_session_expiry,
     revoke_user,
     resolve_license_id,
     set_license_nickname,
@@ -195,6 +201,46 @@ class AuthFlowTests(unittest.TestCase):
         new_code = reset_device(license_id)
         self.assertEqual(get_pending_code("재발급 대상")["code"], new_code)
 
+    def test_set_license_session_expiry_updates_current_sessions(self):
+        code, license_id = issue_code(expires_days=5)
+        token = redeem(
+            RedeemRequest(code=code, device_id=self.first_device)
+        )["access_token"]
+
+        self.assertEqual(set_license_session_expiry(license_id, 90), license_id)
+        connection = sqlite3.connect(os.environ["AUTH_DB_PATH"])
+        try:
+            expires_at = connection.execute(
+                "SELECT expires_at FROM sessions WHERE license_id = ?",
+                (license_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertAlmostEqual(expires_at[0], time.time() + 90 * 24 * 60 * 60, delta=2)
+
+        set_license_session_expiry(license_id, 0)
+        connection = sqlite3.connect(os.environ["AUTH_DB_PATH"])
+        try:
+            expires_at = connection.execute(
+                "SELECT expires_at FROM sessions WHERE license_id = ?",
+                (license_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertIsNone(expires_at)
+
+        _unused_code, unused_license_id = issue_code()
+        with self.assertRaisesRegex(ValueError, "인증 세션이 없습니다"):
+            set_license_session_expiry(unused_license_id, 30)
+        with self.assertRaises(ValueError):
+            set_license_session_expiry(license_id, 366)
+        self.assertTrue(
+            verify(
+                VerifyRequest(device_id=self.first_device),
+                f"Bearer {token}",
+            )["authorized"]
+        )
+
     def test_license_management_accepts_unique_nickname(self):
         _code, license_id = issue_code(nickname="별명 사용자")
         self.assertEqual(resolve_license_id("별명 사용자"), license_id)
@@ -326,6 +372,196 @@ class AuthFlowTests(unittest.TestCase):
         with self.assertRaises(UpdateError):
             update_state({**policy, "download_url": "http://example.com/file.zip"})
 
+    def test_partial_update_zip_accepts_assets_and_rejects_user_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            patch_archive = root / "asset-patch.zip"
+            with zipfile.ZipFile(patch_archive, "w") as archive:
+                archive.writestr(
+                    "KURO_HELPER/assets/boss/new-template.png",
+                    b"image",
+                )
+            payload = _extract_package(patch_archive, root / "extracted")
+            self.assertEqual(
+                (payload / "assets" / "boss" / "new-template.png").read_bytes(),
+                b"image",
+            )
+
+            settings_archive = root / "settings-patch.zip"
+            with zipfile.ZipFile(settings_archive, "w") as archive:
+                archive.writestr("KURO_HELPER/settings.json", "{}")
+            with self.assertRaisesRegex(UpdateError, "개인 설정"):
+                _extract_package(settings_archive, root / "settings-extracted")
+
+    def test_equipment_window_is_clicked_open_only_when_header_is_missing(self):
+        cancel_event = Event()
+        frame = object()
+        with (
+            patch(
+                "core.equipment_window_controls._load_template",
+                side_effect=[object(), object()],
+            ),
+            patch(
+                "core.equipment_window_controls.capture_window",
+                return_value=frame,
+            ),
+            patch(
+                "core.equipment_window_controls._find_template",
+                side_effect=[(None, 0.2), ((12, 18), 0.95), ((40, 50), 0.91)],
+            ),
+            patch(
+                "core.equipment_window_controls.win32gui.ClientToScreen",
+                return_value=(112, 118),
+            ),
+            patch("core.equipment_window_controls.click_active_at_screen") as click,
+        ):
+            opened = ensure_equipment_window_open(
+                1,
+                "아이템 인벤토리",
+                "header.png",
+                "inventory.png",
+                cancel_event,
+                lambda _message: None,
+            )
+        self.assertTrue(opened)
+        click.assert_called_once_with(112, 118)
+
+        with (
+            patch(
+                "core.equipment_window_controls._load_template",
+                return_value=object(),
+            ),
+            patch(
+                "core.equipment_window_controls.capture_window",
+                return_value=frame,
+            ),
+            patch(
+                "core.equipment_window_controls._find_template",
+                return_value=((20, 30), 0.95),
+            ),
+            patch("core.equipment_window_controls.click_active_at_screen") as click,
+        ):
+            opened = ensure_equipment_window_open(
+                1,
+                "장비 창",
+                "header.png",
+                "equipment.png",
+                cancel_event,
+                lambda _message: None,
+            )
+        self.assertTrue(opened)
+        click.assert_not_called()
+
+    def test_inventory_expands_only_when_plus_template_is_visible(self):
+        frame = object()
+        cancel_event = Event()
+        status_messages = []
+        with (
+            patch(
+                "core.equipment_window_controls._load_template",
+                side_effect=[object(), object()],
+            ),
+            patch(
+                "core.equipment_window_controls.capture_window",
+                return_value=frame,
+            ),
+            patch(
+                "core.equipment_window_controls._find_template",
+                side_effect=[((12, 18), 0.95), ((40, 50), 0.91)],
+            ),
+            patch(
+                "core.equipment_window_controls.win32gui.ClientToScreen",
+                return_value=(140, 150),
+            ),
+            patch("core.equipment_window_controls.click_active_at_screen") as click,
+        ):
+            opened = ensure_equipment_window_open(
+                1,
+                "아이템 인벤토리",
+                "header.png",
+                "inventory.png",
+                cancel_event,
+                status_messages.append,
+                expand_button_template="assets/equipment/+.png",
+            )
+
+        self.assertTrue(opened)
+        click.assert_called_once_with(140, 150)
+        self.assertTrue(any("확장" in message for message in status_messages))
+
+    def test_multi_boss_plan_uses_all_equipment_management_storage_counts(self):
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return str(self.value)
+
+        app = SimpleNamespace(
+            equipment_area=object(),
+            equipment_apply_inventory_area=object(),
+            equipment_apply_equipment_count=Entry(2),
+            equipment_apply_cash_count=Entry(1),
+            storage_count_entries={
+                "storage_equipment_count": Entry(3),
+                "storage_installation_count": Entry(4),
+                "storage_cash_count": Entry(2),
+            },
+            equipment_apply_delay_entry=Entry(100),
+            equipment_removal_delay_entry=Entry(200),
+            storage_delay_entry=Entry(300),
+            storage_command_key=Entry("-"),
+            equipment_slot_states={"무기": 1},
+            _get_equipment_apply_slot_client_point=lambda _slot, _size: (10, 20),
+            _get_equipment_slot_client_point=lambda _slot, _size: (30, 40),
+        )
+        with (
+            patch("ui.main_window.find_hwnd_by_process_name", return_value=1),
+            patch(
+                "ui.main_window.capture_window",
+                return_value=SimpleNamespace(shape=(100, 200, 3)),
+            ),
+        ):
+            plan = KuroHelper._build_multi_boss_equipment_plan(app)
+
+        self.assertEqual(
+            plan["storage_counts"],
+            {"equipment": 3, "installation": 4, "cash": 2},
+        )
+
+    def test_boss_rotation_sets_game_resolution_and_restores_clipboard_text(self):
+        tester = MultiCharacterTester.__new__(MultiCharacterTester)
+        tester._keyboard = unittest.mock.Mock()
+        tester.update_status = unittest.mock.Mock()
+        cancel_event = Event()
+        with (
+            patch("core.multi_character_tester.win32gui.IsIconic", return_value=False),
+            patch("core.multi_character_tester.win32gui.SetForegroundWindow"),
+            patch("core.multi_character_tester.win32gui.GetForegroundWindow", return_value=7),
+            patch("core.multi_character_tester.time.sleep"),
+            patch("core.multi_character_tester.win32clipboard.OpenClipboard"),
+            patch("core.multi_character_tester.win32clipboard.CloseClipboard"),
+            patch(
+                "core.multi_character_tester.win32clipboard.IsClipboardFormatAvailable",
+                return_value=True,
+            ),
+            patch(
+                "core.multi_character_tester.win32clipboard.GetClipboardData",
+                return_value="previous clipboard text",
+            ),
+            patch("core.multi_character_tester.win32clipboard.SetClipboardText") as set_text,
+        ):
+            tester._set_game_resolution(7, cancel_event)
+
+        pressed = [call.args[0] for call in tester._keyboard.press.call_args_list]
+        released = [call.args[0] for call in tester._keyboard.release.call_args_list]
+        self.assertEqual(pressed, [Key.enter, Key.ctrl, "v", Key.enter, Key.enter])
+        self.assertEqual(released, [Key.enter, "v", Key.ctrl, Key.enter, Key.enter])
+        self.assertEqual(
+            [call.args[0] for call in set_text.call_args_list],
+            ["@해상도 4", "previous clipboard text"],
+        )
+
     def test_admin_check_reads_member_permissions_and_configured_role(self):
         administrator = SimpleNamespace(
             user=SimpleNamespace(
@@ -364,8 +600,19 @@ class AuthFlowTests(unittest.TestCase):
             )
         }
         self.assertIn("getcode", commands)
+        self.assertIn("setlicenseexpiry", commands)
         self.assertIn("setappupdate", commands)
         self.assertIn("clearappupdate", commands)
+        reset_command = next(
+            command for command in bot.tree.get_commands(
+                guild=discord.Object(id=bot.guild_id)
+            ) if command.name == "resetdevice"
+        )
+        expires_days = next(
+            parameter for parameter in reset_command.parameters
+            if parameter.name == "expires_days"
+        )
+        self.assertTrue(expires_days.required)
 
     def test_license_monitor_notifies_when_server_revokes_session(self):
         revoked = Event()

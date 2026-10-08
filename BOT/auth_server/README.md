@@ -34,6 +34,12 @@
 
 인증 코드를 실제로 한 번만 사용할 수 있도록 DB 트랜잭션을 적용합니다. 등록, 인증, 기기 초기화, 권한 취소는 SQL RPC 함수로 실행됩니다.
 
+## 인증 기한 관리
+
+- `/resetdevice license_id:<관리 ID 또는 별명> expires_days:<일수>`는 기기 연결을 초기화하고 새 코드를 발급합니다. 기간은 필수이며 `0`은 무제한, `1~365`는 일수입니다.
+- `/setlicenseexpiry license_id:<관리 ID 또는 별명> expires_days:<일수>`는 이미 인증된 계정의 세션 기한을 명령 실행 시점부터 지정한 일수로 변경합니다. 기기 연결과 인증 코드는 유지되며, `0`은 무제한입니다.
+- 새 `/setlicenseexpiry` 명령을 배포하기 전에는 위 단계대로 Supabase SQL Editor에서 최신 `supabase_schema.sql`을 실행해 RPC를 반영하세요.
+
 ## Render 테스트 서버 설정
 
 저장소 루트의 `render.yaml`은 Render 무료 테스트 서비스를 구성합니다. 봇과 API는 한 프로세스에서 실행되므로 개인 PC를 켜둘 필요가 없습니다.
@@ -96,13 +102,18 @@ Supabase 환경변수를 지정하지 않으면 개발용 SQLite를 사용합니
 
 `core/app_version.py`의 버전을 올린 뒤 Windows에서 Visual Studio C++ Build Tools를 설치하고 `packaging/build_release.bat`을 실행하면 인증 필수 EXE와 ZIP이 생성됩니다. 배포본에는 앱의 권장 기본 `settings.json`이 포함되며 개발 PC의 개인 설정은 복사하지 않습니다. 첫 업데이트 기능이 포함된 빌드는 기존 버전에 업데이터가 없으므로 테스터에게 한 번 수동 배포해야 합니다.
 
-후속 업데이트는 ZIP을 HTTPS로 접근 가능한 릴리스에 올리고 SHA-256을 계산합니다.
+최초에는 `배포용\KURO_HELPER.zip` 전체를 테스터에게 공유하고 압축을 풀어 사용합니다. 이후 업데이트는 전체 설치 폴더를 다시 받을 필요 없이, 바뀐 파일만 담은 부분 ZIP으로 교체할 수 있습니다. 새 빌드 후 프로젝트 루트에서 포함할 파일만 지정합니다.
 
 ```powershell
-Get-FileHash .\배포용\KURO_HELPER.zip -Algorithm SHA256
+.\packaging\create_update_patch.ps1 -Files @(
+  'KURO_HELPER.exe',
+  'assets\boss\바뀐이미지.png'
+)
 ```
 
-Discord `/setappupdate`에서 버전, 강제 적용 기준, ZIP HTTPS 주소, SHA-256, 안내 문구를 지정합니다. 앱은 실행 시 선택 업데이트를 안내합니다. 강제 대상 앱은 실행 중이면 다음 30초 인증 확인 때 종료되고, 다시 실행할 때 ZIP을 내려받아 해시를 확인한 뒤 교체합니다. `settings.json`과 `보스돌이 기록`은 보존됩니다. `/clearappupdate`는 새 업데이트 정책을 중지합니다.
+스크립트는 `배포용\KURO_HELPER_patch.zip`을 만들고 SHA-256을 출력합니다. ZIP에는 `KURO_HELPER.exe` 또는 `assets`, `characters` 아래에서 지정한 파일만 들어갑니다. 이 ZIP을 HTTPS로 접근 가능한 릴리스에 올리고 Discord `/setappupdate`에 버전, 강제 적용 기준, 패치 ZIP 주소, SHA-256, 안내 문구를 등록합니다. 앱은 ZIP 안에 있는 파일만 설치 폴더의 같은 경로에 덮어쓰며, ZIP에 없는 파일은 유지됩니다. `settings.json`과 `보스돌이 기록`은 패치 대상에서 제외됩니다. `/clearappupdate`는 새 업데이트 정책을 중지합니다.
+
+코드가 바뀌면 onefile EXE 전체를 다시 빌드하고 패치에 `KURO_HELPER.exe`를 포함해야 합니다. 이미지 등 외부 파일만 바뀐 경우에는 해당 파일만 지정하면 됩니다.
 
 ## 제한 사항
 
