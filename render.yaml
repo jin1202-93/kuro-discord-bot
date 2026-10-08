@@ -18,3 +18,5 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+      - key: CODE_ENCRYPTION_KEY
+        sync: false
