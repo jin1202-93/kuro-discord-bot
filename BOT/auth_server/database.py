@@ -6,6 +6,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 import time
+from cryptography.fernet import Fernet, InvalidToken
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / "auth.sqlite3"
 SESSION_DAYS = 30
@@ -14,6 +15,8 @@ LICENSE_TIERS = frozenset(("basic", "premium"))
 MAX_NICKNAME_LENGTH = 32
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LICENSE_ID_PATTERN = re.compile(r"[A-F0-9]{16}")
+APP_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
+SHA256_PATTERN = re.compile(r"[A-Fa-f0-9]{64}")
 
 
 def _database_path():
@@ -28,6 +31,8 @@ def _uses_supabase():
         raise RuntimeError("SUPABASE_URL과 SUPABASE_KEY를 모두 설정해야 합니다.")
     if os.environ.get("RENDER") and not url:
         raise RuntimeError("Render 배포에는 SUPABASE_URL과 SUPABASE_KEY가 필요합니다.")
+    if os.environ.get("RENDER"):
+        _code_cipher()
     return bool(url)
 
 
@@ -77,7 +82,8 @@ def initialize_database():
                 code_hash TEXT PRIMARY KEY,
                 license_id TEXT NOT NULL,
                 expires_at REAL,
-                used INTEGER NOT NULL DEFAULT 0
+                used INTEGER NOT NULL DEFAULT 0,
+                code_encrypted TEXT
             );
             CREATE TABLE IF NOT EXISTS licenses (
                 license_id TEXT PRIMARY KEY,
@@ -93,6 +99,15 @@ def initialize_database():
                 license_id TEXT NOT NULL,
                 device_id TEXT NOT NULL,
                 expires_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS app_updates (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version TEXT NOT NULL,
+                minimum_version TEXT NOT NULL,
+                download_url TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                release_notes TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS sessions_user_idx
                 ON sessions(license_id);
@@ -110,6 +125,12 @@ def initialize_database():
             )
         if "nickname" not in license_columns:
             connection.execute("ALTER TABLE licenses ADD COLUMN nickname TEXT")
+        code_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(auth_codes)")
+        }
+        if "code_encrypted" not in code_columns:
+            connection.execute("ALTER TABLE auth_codes ADD COLUMN code_encrypted TEXT")
 
 
 def _supabase_error(error):
@@ -141,6 +162,29 @@ def _sha256(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _code_cipher():
+    key = os.environ.get("CODE_ENCRYPTION_KEY", "").strip()
+    if not key:
+        raise RuntimeError("CODE_ENCRYPTION_KEY를 서버 환경변수에 설정하세요.")
+    try:
+        return Fernet(key.encode("ascii"))
+    except (ValueError, UnicodeError) as error:
+        raise RuntimeError("CODE_ENCRYPTION_KEY가 올바른 Fernet 키가 아닙니다.") from error
+
+
+def _encrypt_code(code):
+    return _code_cipher().encrypt(code.encode("ascii")).decode("ascii")
+
+
+def _decrypt_code(encrypted_code):
+    try:
+        return _code_cipher().decrypt(encrypted_code.encode("ascii")).decode("ascii")
+    except (InvalidToken, UnicodeError) as error:
+        raise RuntimeError(
+            "암호화 키가 변경되었거나 저장된 코드를 복호화할 수 없습니다."
+        ) from error
+
+
 def _new_code():
     characters = "".join(secrets.choice(CODE_ALPHABET) for _ in range(24))
     return "-".join(characters[index:index + 4] for index in range(0, 24, 4))
@@ -151,6 +195,42 @@ def _validate_license_id(license_id):
     if not LICENSE_ID_PATTERN.fullmatch(normalized):
         raise ValueError("관리 ID는 발급 메시지에 표시된 16자리 영문/숫자 값이어야 합니다.")
     return normalized
+
+
+def resolve_license_id(license_id_or_nickname):
+    lookup = str(license_id_or_nickname).strip()
+    if LICENSE_ID_PATTERN.fullmatch(lookup.upper()):
+        return lookup.upper()
+    if not lookup or len(lookup) > MAX_NICKNAME_LENGTH:
+        raise ValueError("관리 ID 또는 등록된 별명을 입력하세요.")
+
+    if _uses_supabase():
+        try:
+            rows = (
+                _get_supabase_client()
+                .table("kuro_auth_licenses_v2")
+                .select("license_id")
+                .eq("nickname", lookup)
+                .limit(2)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as error:
+            _supabase_error(error)
+    else:
+        with _connection() as connection:
+            rows = _execute(
+                connection,
+                "SELECT license_id FROM licenses WHERE nickname = ? LIMIT 2",
+                (lookup,),
+            ).fetchall()
+
+    if len(rows) > 1:
+        raise ValueError("같은 별명을 가진 계정이 여러 개입니다. 관리 ID를 입력하세요.")
+    if not rows:
+        raise ValueError("관리 ID 또는 별명을 찾을 수 없습니다.")
+    return rows[0]["license_id"]
 
 
 def _validate_tier(tier):
@@ -178,6 +258,7 @@ def issue_code(expires_days=30, tier="basic", nickname=None):
     code = _new_code()
     license_id = secrets.token_hex(8).upper()
     code_hash = _sha256(code)
+    code_encrypted = _encrypt_code(code)
 
     if _uses_supabase():
         try:
@@ -189,6 +270,7 @@ def issue_code(expires_days=30, tier="basic", nickname=None):
                     "p_expires_days": expires_days,
                     "p_tier": tier,
                     "p_nickname": nickname,
+                    "p_code_encrypted": code_encrypted,
                 },
             ).execute()
         except Exception as error:
@@ -206,12 +288,13 @@ def issue_code(expires_days=30, tier="basic", nickname=None):
         )
         _execute(
             connection,
-            "INSERT INTO auth_codes(code_hash, license_id, expires_at) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO auth_codes(code_hash, license_id, expires_at, code_encrypted) "
+            "VALUES (?, ?, ?, ?)",
             (
                 code_hash,
                 license_id,
                 None if expires_days == 0 else now + expires_days * 24 * 60 * 60,
+                code_encrypted,
             ),
         )
     return code, license_id
@@ -277,7 +360,7 @@ def redeem_code(code, device_id):
         )
         _execute(
             connection,
-            "UPDATE auth_codes SET used = 1 WHERE code_hash = ?",
+            "UPDATE auth_codes SET used = 1, code_encrypted = NULL WHERE code_hash = ?",
             (_sha256(code),),
         )
         _execute(
@@ -343,7 +426,7 @@ def verify_session(token, device_id):
 
 
 def get_license_status(license_id):
-    license_id = _validate_license_id(license_id)
+    license_id = resolve_license_id(license_id)
     if _uses_supabase():
         try:
             result = (
@@ -395,7 +478,7 @@ def get_license_status(license_id):
 
 
 def set_license_tier(license_id, tier):
-    license_id = _validate_license_id(license_id)
+    license_id = resolve_license_id(license_id)
     tier = _validate_tier(tier)
     if _uses_supabase():
         try:
@@ -417,7 +500,7 @@ def set_license_tier(license_id, tier):
 
 
 def set_license_nickname(license_id, nickname):
-    license_id = _validate_license_id(license_id)
+    license_id = resolve_license_id(license_id)
     nickname = _validate_nickname(nickname)
     if nickname is None:
         raise ValueError(f"별명은 1~{MAX_NICKNAME_LENGTH}자로 입력하세요.")
@@ -440,12 +523,199 @@ def set_license_nickname(license_id, nickname):
     return get_license_status(license_id)
 
 
+def get_pending_code(license_id_or_nickname):
+    query = str(license_id_or_nickname).strip()
+    if not query:
+        raise ValueError("관리 ID 또는 등록된 별명을 입력하세요.")
+
+    if _uses_supabase():
+        try:
+            licenses = _get_supabase_client().table("kuro_auth_licenses_v2").select(
+                "license_id,active,tier,nickname"
+            )
+            if LICENSE_ID_PATTERN.fullmatch(query.upper()):
+                licenses = licenses.eq("license_id", query.upper())
+            else:
+                licenses = licenses.eq("nickname", query).limit(2)
+            license_rows = licenses.execute().data or []
+            if len(license_rows) > 1:
+                raise ValueError("같은 별명을 가진 계정이 여러 개입니다. 관리 ID로 조회하세요.")
+            if not license_rows:
+                raise ValueError("관리 ID 또는 별명을 찾을 수 없습니다.")
+            license_row = license_rows[0]
+            code_rows = (
+                _get_supabase_client()
+                .table("kuro_auth_codes_v2")
+                .select("code_encrypted,expires_at")
+                .eq("license_id", license_row["license_id"])
+                .eq("used", False)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        except ValueError:
+            raise
+        except Exception as error:
+            _supabase_error(error)
+    else:
+        with _connection() as connection:
+            if LICENSE_ID_PATTERN.fullmatch(query.upper()):
+                license_rows = _execute(
+                    connection,
+                    "SELECT license_id, active, tier, nickname FROM licenses "
+                    "WHERE license_id = ?",
+                    (query.upper(),),
+                ).fetchall()
+            else:
+                license_rows = _execute(
+                    connection,
+                    "SELECT license_id, active, tier, nickname FROM licenses "
+                    "WHERE nickname = ? LIMIT 2",
+                    (query,),
+                ).fetchall()
+            if len(license_rows) > 1:
+                raise ValueError("같은 별명을 가진 계정이 여러 개입니다. 관리 ID로 조회하세요.")
+            if not license_rows:
+                raise ValueError("관리 ID 또는 별명을 찾을 수 없습니다.")
+            license_row = license_rows[0]
+            code_rows = _execute(
+                connection,
+                "SELECT code_encrypted, expires_at FROM auth_codes "
+                "WHERE license_id = ? AND used = 0 LIMIT 1",
+                (license_row["license_id"],),
+            ).fetchall()
+
+    if not license_row["active"]:
+        raise ValueError("인증이 취소된 계정입니다.")
+    if not code_rows:
+        raise ValueError("사용 가능한 미사용 코드가 없습니다. /resetdevice로 새 코드를 발급하세요.")
+    code_row = code_rows[0]
+    if not code_row["code_encrypted"]:
+        raise ValueError("기존 코드는 암호화 저장 전 발급되어 조회할 수 없습니다. /resetdevice로 재발급하세요.")
+    expires_at = code_row["expires_at"]
+    if isinstance(expires_at, str):
+        from datetime import datetime
+
+        expires_at = datetime.fromisoformat(
+            expires_at.replace("Z", "+00:00")
+        ).timestamp()
+    if expires_at is not None and float(expires_at) <= time.time():
+        raise ValueError("코드가 만료되었습니다. /resetdevice로 새 코드를 발급하세요.")
+    return {
+        "license_id": license_row["license_id"],
+        "nickname": license_row["nickname"],
+        "tier": _validate_tier(license_row["tier"]),
+        "code": _decrypt_code(code_row["code_encrypted"]),
+    }
+
+
+def _validate_app_version(version):
+    normalized = str(version).strip()
+    if not APP_VERSION_PATTERN.fullmatch(normalized):
+        raise ValueError("버전은 major.minor.patch 형식으로 입력하세요. 예: 1.2.3")
+    return tuple(int(part) for part in normalized.split("."))
+
+
+def set_app_update(version, minimum_version, download_url, sha256, release_notes=""):
+    version_key = _validate_app_version(version)
+    minimum_key = _validate_app_version(minimum_version)
+    version = str(version).strip()
+    minimum_version = str(minimum_version).strip()
+    download_url = str(download_url).strip()
+    sha256 = str(sha256).strip().lower()
+    release_notes = str(release_notes).strip()
+    if minimum_key > version_key:
+        raise ValueError("강제 적용 버전은 최신 버전보다 높을 수 없습니다.")
+    if not download_url.startswith("https://") or len(download_url) > 2048:
+        raise ValueError("다운로드 주소는 HTTPS URL이어야 합니다.")
+    if not SHA256_PATTERN.fullmatch(sha256):
+        raise ValueError("SHA-256은 64자리 16진수여야 합니다.")
+    if len(release_notes) > 500:
+        raise ValueError("업데이트 안내는 500자 이내로 입력하세요.")
+
+    values = {
+        "version": version,
+        "minimum_version": minimum_version,
+        "download_url": download_url,
+        "sha256": sha256,
+        "release_notes": release_notes,
+    }
+    if _uses_supabase():
+        try:
+            _get_supabase_client().table("kuro_auth_app_updates_v2").upsert(
+                {"id": 1, **values}, on_conflict="id"
+            ).execute()
+        except Exception as error:
+            _supabase_error(error)
+    else:
+        with _connection() as connection:
+            _execute(
+                connection,
+                "INSERT INTO app_updates "
+                "(id, version, minimum_version, download_url, sha256, release_notes, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET version=excluded.version, "
+                "minimum_version=excluded.minimum_version, download_url=excluded.download_url, "
+                "sha256=excluded.sha256, release_notes=excluded.release_notes, "
+                "updated_at=excluded.updated_at",
+                (
+                    version,
+                    minimum_version,
+                    download_url,
+                    sha256,
+                    release_notes,
+                    time.time(),
+                ),
+            )
+    return get_app_update()
+
+
+def get_app_update():
+    if _uses_supabase():
+        try:
+            result = (
+                _get_supabase_client()
+                .table("kuro_auth_app_updates_v2")
+                .select("version,minimum_version,download_url,sha256,release_notes")
+                .eq("id", 1)
+                .limit(1)
+                .execute()
+            )
+        except Exception as error:
+            _supabase_error(error)
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    with _connection() as connection:
+        row = _execute(
+            connection,
+            "SELECT version, minimum_version, download_url, sha256, release_notes "
+            "FROM app_updates WHERE id = 1",
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def clear_app_update():
+    if _uses_supabase():
+        try:
+            _get_supabase_client().table("kuro_auth_app_updates_v2").delete().eq(
+                "id", 1
+            ).execute()
+        except Exception as error:
+            _supabase_error(error)
+        return
+    with _connection() as connection:
+        _execute(connection, "DELETE FROM app_updates WHERE id = 1")
+
+
 def reset_device(license_id, expires_days=30):
-    license_id = _validate_license_id(license_id)
+    license_id = resolve_license_id(license_id)
     if not 0 <= expires_days <= 365:
         raise ValueError("코드 유효기간은 0(무제한)~365일이어야 합니다.")
     code = _new_code()
     code_hash = _sha256(code)
+    code_encrypted = _encrypt_code(code)
     if _uses_supabase():
         try:
             _get_supabase_client().rpc(
@@ -454,6 +724,7 @@ def reset_device(license_id, expires_days=30):
                     "p_license_id": license_id,
                     "p_code_hash": code_hash,
                     "p_expires_days": expires_days,
+                    "p_code_encrypted": code_encrypted,
                 },
             ).execute()
         except Exception as error:
@@ -488,18 +759,20 @@ def reset_device(license_id, expires_days=30):
         )
         _execute(
             connection,
-            "INSERT INTO auth_codes(code_hash, license_id, expires_at) VALUES (?, ?, ?)",
+            "INSERT INTO auth_codes(code_hash, license_id, expires_at, code_encrypted) "
+            "VALUES (?, ?, ?, ?)",
             (
                 code_hash,
                 license_id,
                 None if expires_days == 0 else time.time() + expires_days * 24 * 60 * 60,
+                code_encrypted,
             ),
         )
     return code
 
 
 def revoke_user(license_id):
-    license_id = _validate_license_id(license_id)
+    license_id = resolve_license_id(license_id)
     if _uses_supabase():
         try:
             _get_supabase_client().rpc(

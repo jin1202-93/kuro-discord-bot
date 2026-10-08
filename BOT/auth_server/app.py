@@ -8,6 +8,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from auth_server.database import (
+    get_app_update,
     get_license_status,
     initialize_database,
     redeem_code,
@@ -80,7 +81,11 @@ def redeem(request: RedeemRequest):
     if license_id is None:
         raise HTTPException(status_code=401, detail="인증 코드를 확인할 수 없습니다.")
     status = get_license_status(license_id)
-    return {"access_token": token, "tier": status["tier"]}
+    return {
+        "access_token": token,
+        "tier": status["tier"],
+        "app_update": get_app_update(),
+    }
 
 
 @app.post("/v1/auth/verify")
@@ -101,4 +106,5 @@ def verify(request: VerifyRequest, authorization: str | None = Header(default=No
         "authorized": True,
         "license_id": license_id,
         "tier": status["tier"],
+        "app_update": get_app_update(),
     }

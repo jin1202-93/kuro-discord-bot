@@ -7,10 +7,14 @@ from discord import app_commands
 from discord.ext import commands
 
 from auth_server.database import (
+    clear_app_update,
+    get_pending_code,
     get_license_status,
+    set_app_update,
     issue_code,
     reset_device,
     revoke_user,
+    resolve_license_id,
     set_license_nickname,
     set_license_tier,
 )
@@ -148,7 +152,7 @@ def create_bot():
         guild=guild,
     )
     @app_commands.describe(
-        license_id="코드 발급 시 함께 표시된 관리 ID",
+        license_id="관리 ID 또는 등록된 별명 (정확히 일치)",
         expires_days="새 인증 코드 유효기간(일, 0=무제한, 1~365)",
     )
     async def resetdevice(
@@ -170,7 +174,11 @@ def create_bot():
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
+            license_id = await asyncio.to_thread(resolve_license_id, license_id)
             code = await asyncio.to_thread(reset_device, license_id, expires_days)
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
         except Exception:
             logger.exception("Failed to reset an authentication license")
             await interaction.followup.send(
@@ -185,11 +193,57 @@ def create_bot():
         )
 
     @bot.tree.command(
+        name="getcode",
+        description="미사용 인증 코드를 관리 ID 또는 별명으로 조회합니다.",
+        guild=guild,
+    )
+    @app_commands.describe(
+        lookup="코드 발급 시 표시된 관리 ID 또는 등록된 별명",
+    )
+    async def getcode(
+        interaction: discord.Interaction,
+        lookup: app_commands.Range[str, 1, 32],
+    ):
+        if interaction.guild_id != bot.guild_id:
+            await interaction.response.send_message(
+                "등록된 인증 서버에서만 사용할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        if not _is_admin(interaction, bot.admin_role_id):
+            await interaction.response.send_message(
+                "관리자만 인증 코드를 조회할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await asyncio.to_thread(get_pending_code, lookup)
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        except Exception:
+            logger.exception("Failed to retrieve a pending authentication code")
+            await interaction.followup.send(
+                "인증 코드 조회에 실패했습니다. Render 로그를 확인하세요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"관리 ID: `{result['license_id']}`\n"
+            f"별명: `{result['nickname'] or '미등록'}`\n"
+            f"등급: **{_tier_text(result['tier'])}**\n"
+            f"미사용 인증 코드: `{result['code']}`\n"
+            "인증 코드는 관리자에게만 표시됩니다. 필요한 테스터에게 안전하게 전달하세요.",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(
         name="revokeuser",
         description="사용자의 KURO HELPER 인증을 취소합니다.",
         guild=guild,
     )
-    @app_commands.describe(license_id="코드 발급 시 함께 표시된 관리 ID")
+    @app_commands.describe(license_id="관리 ID 또는 등록된 별명 (정확히 일치)")
     async def revokeuser(
         interaction: discord.Interaction,
         license_id: str,
@@ -208,7 +262,11 @@ def create_bot():
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
+            license_id = await asyncio.to_thread(resolve_license_id, license_id)
             await asyncio.to_thread(revoke_user, license_id)
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
         except Exception:
             logger.exception("Failed to revoke an authentication license")
             await interaction.followup.send(
@@ -227,7 +285,7 @@ def create_bot():
         description="사용자의 인증 및 최근 접속 상태를 확인합니다.",
         guild=guild,
     )
-    @app_commands.describe(license_id="코드 발급 시 함께 표시된 관리 ID")
+    @app_commands.describe(license_id="관리 ID 또는 등록된 별명 (정확히 일치)")
     async def checkuser(
         interaction: discord.Interaction,
         license_id: str,
@@ -247,6 +305,9 @@ def create_bot():
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             status = await asyncio.to_thread(get_license_status, license_id)
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
         except Exception:
             logger.exception("Failed to check an authentication license")
             await interaction.followup.send(
@@ -282,7 +343,7 @@ def create_bot():
         guild=guild,
     )
     @app_commands.describe(
-        license_id="코드 발급 시 함께 표시된 관리 ID",
+        license_id="관리 ID 또는 등록된 별명 (정확히 일치)",
         tier="변경할 인증 등급",
     )
     @app_commands.choices(
@@ -315,6 +376,9 @@ def create_bot():
                 license_id,
                 tier.value,
             )
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
         except Exception:
             logger.exception("Failed to change an authentication tier")
             await interaction.followup.send(
@@ -335,7 +399,7 @@ def create_bot():
         guild=guild,
     )
     @app_commands.describe(
-        license_id="코드 발급 시 함께 표시된 관리 ID",
+        license_id="관리 ID 또는 등록된 별명 (정확히 일치)",
         nickname="관리자가 구분할 별명 (최대 32자)",
     )
     async def setnickname(
@@ -362,6 +426,9 @@ def create_bot():
                 license_id,
                 nickname,
             )
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
         except Exception:
             logger.exception("Failed to change an authentication nickname")
             await interaction.followup.send(
@@ -372,6 +439,98 @@ def create_bot():
         await interaction.followup.send(
             f"관리 ID `{status['license_id']}` 별명을 "
             f"`{status['nickname']}`(으)로 저장했습니다.",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(
+        name="setappupdate",
+        description="클라이언트 업데이트를 등록하거나 강제합니다.",
+        guild=guild,
+    )
+    @app_commands.describe(
+        version="배포할 버전 (예: 1.2.3)",
+        minimum_version="이 버전 미만은 업데이트 필수 (0.0.0이면 안내만)",
+        download_url="배포 ZIP의 HTTPS 다운로드 주소",
+        sha256="ZIP의 SHA-256 체크섬 64자리",
+        release_notes="업데이트 안내 (최대 500자)",
+    )
+    async def setappupdate(
+        interaction: discord.Interaction,
+        version: app_commands.Range[str, 5, 32],
+        minimum_version: app_commands.Range[str, 5, 32],
+        download_url: app_commands.Range[str, 12, 2048],
+        sha256: app_commands.Range[str, 64, 64],
+        release_notes: str | None = None,
+    ):
+        if interaction.guild_id != bot.guild_id:
+            await interaction.response.send_message(
+                "등록된 인증 서버에서만 사용할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        if not _is_admin(interaction, bot.admin_role_id):
+            await interaction.response.send_message(
+                "관리자만 클라이언트 업데이트를 등록할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            policy = await asyncio.to_thread(
+                set_app_update,
+                version,
+                minimum_version,
+                download_url,
+                sha256,
+                release_notes or "",
+            )
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        except Exception:
+            logger.exception("Failed to publish a client update")
+            await interaction.followup.send(
+                "업데이트 등록에 실패했습니다. Render 로그를 확인하세요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"버전 `{policy['version']}` 업데이트를 등록했습니다.\n"
+            f"강제 적용 기준: `{policy['minimum_version']}` 미만 "
+            "(0.0.0이면 안내 후 선택 설치)",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(
+        name="clearappupdate",
+        description="등록된 클라이언트 업데이트 정책을 해제합니다.",
+        guild=guild,
+    )
+    async def clearappupdate(interaction: discord.Interaction):
+        if interaction.guild_id != bot.guild_id:
+            await interaction.response.send_message(
+                "등록된 인증 서버에서만 사용할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        if not _is_admin(interaction, bot.admin_role_id):
+            await interaction.response.send_message(
+                "관리자만 클라이언트 업데이트를 해제할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await asyncio.to_thread(clear_app_update)
+        except Exception:
+            logger.exception("Failed to clear a client update policy")
+            await interaction.followup.send(
+                "업데이트 해제에 실패했습니다. Render 로그를 확인하세요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            "클라이언트 업데이트 정책을 해제했습니다.",
             ephemeral=True,
         )
 

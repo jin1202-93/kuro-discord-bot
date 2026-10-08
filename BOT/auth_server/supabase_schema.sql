@@ -2,7 +2,8 @@ CREATE TABLE IF NOT EXISTS public.kuro_auth_codes_v2 (
     code_hash text PRIMARY KEY,
     license_id text NOT NULL,
     expires_at timestamptz,
-    used boolean NOT NULL DEFAULT false
+    used boolean NOT NULL DEFAULT false,
+    code_encrypted text
 );
 
 CREATE TABLE IF NOT EXISTS public.kuro_auth_licenses_v2 (
@@ -22,7 +23,19 @@ CREATE TABLE IF NOT EXISTS public.kuro_auth_sessions_v2 (
     expires_at timestamptz
 );
 
+CREATE TABLE IF NOT EXISTS public.kuro_auth_app_updates_v2 (
+    id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    version text NOT NULL,
+    minimum_version text NOT NULL,
+    download_url text NOT NULL,
+    sha256 text NOT NULL,
+    release_notes text NOT NULL DEFAULT '',
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 ALTER TABLE public.kuro_auth_codes_v2 ALTER COLUMN expires_at DROP NOT NULL;
+ALTER TABLE public.kuro_auth_codes_v2
+    ADD COLUMN IF NOT EXISTS code_encrypted text;
 ALTER TABLE public.kuro_auth_sessions_v2 ALTER COLUMN expires_at DROP NOT NULL;
 ALTER TABLE public.kuro_auth_licenses_v2 ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
 ALTER TABLE public.kuro_auth_licenses_v2
@@ -36,21 +49,26 @@ CREATE INDEX IF NOT EXISTS kuro_auth_sessions_v2_license_idx
 ALTER TABLE public.kuro_auth_codes_v2 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.kuro_auth_licenses_v2 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.kuro_auth_sessions_v2 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.kuro_auth_app_updates_v2 ENABLE ROW LEVEL SECURITY;
 
-REVOKE ALL ON public.kuro_auth_codes_v2, public.kuro_auth_licenses_v2, public.kuro_auth_sessions_v2
+REVOKE ALL ON public.kuro_auth_codes_v2, public.kuro_auth_licenses_v2, public.kuro_auth_sessions_v2,
+    public.kuro_auth_app_updates_v2
     FROM anon, authenticated;
-GRANT ALL ON public.kuro_auth_codes_v2, public.kuro_auth_licenses_v2, public.kuro_auth_sessions_v2
+GRANT ALL ON public.kuro_auth_codes_v2, public.kuro_auth_licenses_v2, public.kuro_auth_sessions_v2,
+    public.kuro_auth_app_updates_v2
     TO service_role;
 
 DROP FUNCTION IF EXISTS public.issue_auth_code_v2(text, text, integer);
 DROP FUNCTION IF EXISTS public.issue_auth_code_v2(text, text, integer, text);
+DROP FUNCTION IF EXISTS public.issue_auth_code_v2(text, text, integer, text, text);
 
 CREATE OR REPLACE FUNCTION public.issue_auth_code_v2(
     p_license_id text,
     p_code_hash text,
     p_expires_days integer,
     p_tier text,
-    p_nickname text
+    p_nickname text,
+    p_code_encrypted text
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -71,14 +89,15 @@ BEGIN
     INSERT INTO public.kuro_auth_licenses_v2(license_id, tier, nickname)
     VALUES (p_license_id, p_tier, NULLIF(btrim(p_nickname), ''));
 
-    INSERT INTO public.kuro_auth_codes_v2(code_hash, license_id, expires_at)
+    INSERT INTO public.kuro_auth_codes_v2(code_hash, license_id, expires_at, code_encrypted)
     VALUES (
         p_code_hash,
         p_license_id,
         CASE
             WHEN p_expires_days = 0 THEN NULL
             ELSE now() + make_interval(days => p_expires_days)
-        END
+        END,
+        p_code_encrypted
     );
 EXCEPTION WHEN unique_violation THEN
     RAISE EXCEPTION 'AUTH_CODE_DUPLICATE';
@@ -129,7 +148,9 @@ BEGIN
     SET device_id = p_device_id
     WHERE license_id = v_code.license_id;
 
-    UPDATE public.kuro_auth_codes_v2 SET used = true WHERE code_hash = p_code_hash;
+    UPDATE public.kuro_auth_codes_v2
+    SET used = true, code_encrypted = NULL
+    WHERE code_hash = p_code_hash;
 
     INSERT INTO public.kuro_auth_sessions_v2(token_hash, license_id, device_id, expires_at)
     VALUES (
@@ -183,10 +204,13 @@ BEGIN
 END;
 $$;
 
+DROP FUNCTION IF EXISTS public.reset_auth_device_v2(text, text, integer);
+
 CREATE OR REPLACE FUNCTION public.reset_auth_device_v2(
     p_license_id text,
     p_code_hash text,
-    p_expires_days integer
+    p_expires_days integer,
+    p_code_encrypted text
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -209,14 +233,15 @@ BEGIN
 
     DELETE FROM public.kuro_auth_sessions_v2 WHERE license_id = p_license_id;
     DELETE FROM public.kuro_auth_codes_v2 WHERE license_id = p_license_id;
-    INSERT INTO public.kuro_auth_codes_v2(code_hash, license_id, expires_at)
+    INSERT INTO public.kuro_auth_codes_v2(code_hash, license_id, expires_at, code_encrypted)
     VALUES (
         p_code_hash,
         p_license_id,
         CASE
             WHEN p_expires_days = 0 THEN NULL
             ELSE now() + make_interval(days => p_expires_days)
-        END
+        END,
+        p_code_encrypted
     );
 END;
 $$;
@@ -238,24 +263,24 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.issue_auth_code_v2(text, text, integer, text, text)
+REVOKE ALL ON FUNCTION public.issue_auth_code_v2(text, text, integer, text, text, text)
     FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.redeem_auth_code_v2(text, text, text)
     FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.verify_auth_session_v2(text, text)
     FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.reset_auth_device_v2(text, text, integer)
+REVOKE ALL ON FUNCTION public.reset_auth_device_v2(text, text, integer, text)
     FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.revoke_auth_user_v2(text)
     FROM PUBLIC, anon, authenticated;
 
-GRANT EXECUTE ON FUNCTION public.issue_auth_code_v2(text, text, integer, text, text)
+GRANT EXECUTE ON FUNCTION public.issue_auth_code_v2(text, text, integer, text, text, text)
     TO service_role;
 GRANT EXECUTE ON FUNCTION public.redeem_auth_code_v2(text, text, text)
     TO service_role;
 GRANT EXECUTE ON FUNCTION public.verify_auth_session_v2(text, text)
     TO service_role;
-GRANT EXECUTE ON FUNCTION public.reset_auth_device_v2(text, text, integer)
+GRANT EXECUTE ON FUNCTION public.reset_auth_device_v2(text, text, integer, text)
     TO service_role;
 GRANT EXECUTE ON FUNCTION public.revoke_auth_user_v2(text)
     TO service_role;

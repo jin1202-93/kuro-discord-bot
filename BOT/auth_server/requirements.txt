@@ -2,3 +2,4 @@ discord.py>=2.4,<3
 fastapi>=0.110,<1
 uvicorn[standard]>=0.27,<1
 supabase>=2.6,<3
+cryptography>=42,<47
