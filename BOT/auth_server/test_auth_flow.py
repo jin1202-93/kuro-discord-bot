@@ -2,21 +2,29 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 from threading import Event
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from core.auth_client import AuthenticationError, LicenseMonitor
+from core.auth_client import (
+    AuthenticationError,
+    LicenseMonitor,
+    license_tier_allows,
+)
 from auth_server.bot import _is_admin
 
 from auth_server.app import RedeemRequest, VerifyRequest, health_check, redeem, verify
 from auth_server.database import (
     initialize_database,
+    get_license_status,
     issue_code,
     reset_device,
     revoke_user,
+    set_license_nickname,
+    set_license_tier,
 )
 
 
@@ -120,12 +128,60 @@ class AuthFlowTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertNotEqual(code, stored_hash)
 
+    def test_verify_updates_online_presence_and_stales_after_90_seconds(self):
+        code, license_id = issue_code()
+        token = redeem(
+            RedeemRequest(code=code, device_id=self.first_device)
+        )["access_token"]
+
+        self.assertTrue(get_license_status(license_id)["online"])
+        verify(
+            VerifyRequest(device_id=self.first_device),
+            f"Bearer {token}",
+        )
+        status = get_license_status(license_id)
+        self.assertTrue(status["online"])
+        self.assertIsNotNone(status["last_seen_at"])
+
+        with sqlite3.connect(os.environ["AUTH_DB_PATH"]) as connection:
+            connection.execute(
+                "UPDATE licenses SET last_seen_at = ? WHERE license_id = ?",
+                (time.time() - 91, license_id),
+            )
+        self.assertFalse(get_license_status(license_id)["online"])
+
     def test_code_format_and_expiry_are_validated(self):
         code, license_id = issue_code()
         self.assertRegex(code, r"^(?:[A-HJ-NP-Z2-9]{4}-){5}[A-HJ-NP-Z2-9]{4}$")
         self.assertRegex(license_id, r"^[A-F0-9]{16}$")
         with self.assertRaises(ValueError):
             issue_code(expires_days=366)
+
+    def test_tiers_and_admin_nickname_flow(self):
+        code, license_id = issue_code(
+            tier="premium",
+            nickname="테스터 A",
+        )
+        self.assertEqual(license_tier_allows("basic", "level_hunt_movement"), False)
+        self.assertTrue(license_tier_allows("premium", "level_hunt_movement"))
+        self.assertTrue(license_tier_allows("basic", "ordinary_boss_move"))
+
+        redeem_result = redeem(
+            RedeemRequest(code=code, device_id=self.first_device)
+        )
+        self.assertEqual(redeem_result["tier"], "premium")
+        status = get_license_status(license_id)
+        self.assertEqual(status["nickname"], "테스터 A")
+
+        set_license_nickname(license_id, "사람 1")
+        status = set_license_tier(license_id, "basic")
+        self.assertEqual(status["nickname"], "사람 1")
+        self.assertEqual(status["tier"], "basic")
+
+        with self.assertRaises(ValueError):
+            set_license_nickname(license_id, " " * 2)
+        with self.assertRaises(ValueError):
+            set_license_tier(license_id, "gold")
 
     def test_unlimited_code_and_session_last_until_revoked(self):
         code, license_id = issue_code(expires_days=0)
@@ -197,6 +253,36 @@ class AuthFlowTests(unittest.TestCase):
             monitor.start()
             try:
                 self.assertTrue(revoked.wait(timeout=1))
+            finally:
+                monitor.stop()
+
+    def test_license_monitor_notifies_when_tier_changes(self):
+        tier_changed = Event()
+        observed_tiers = []
+
+        def on_tier_changed(tier):
+            observed_tiers.append(tier)
+            tier_changed.set()
+
+        monitor = LicenseMonitor(
+            lambda: None,
+            interval_seconds=0.01,
+            on_tier_changed=on_tier_changed,
+            initial_tier="basic",
+        )
+        with (
+            patch("core.auth_client._load_api_url", return_value="https://auth.test"),
+            patch("core.auth_client._get_machine_id", return_value=self.first_device),
+            patch("core.auth_client._read_saved_token", return_value="saved-token"),
+            patch(
+                "core.auth_client._request",
+                return_value={"authorized": True, "tier": "premium"},
+            ),
+        ):
+            monitor.start()
+            try:
+                self.assertTrue(tier_changed.wait(timeout=1))
+                self.assertEqual(observed_tiers, ["premium"])
             finally:
                 monitor.stop()
 

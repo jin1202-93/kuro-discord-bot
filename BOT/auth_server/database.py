@@ -9,6 +9,9 @@ import time
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / "auth.sqlite3"
 SESSION_DAYS = 30
+ONLINE_WINDOW_SECONDS = 90
+LICENSE_TIERS = frozenset(("basic", "premium"))
+MAX_NICKNAME_LENGTH = 32
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LICENSE_ID_PATTERN = re.compile(r"[A-F0-9]{16}")
 
@@ -80,7 +83,10 @@ def initialize_database():
                 license_id TEXT PRIMARY KEY,
                 device_id TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                last_seen_at REAL,
+                tier TEXT NOT NULL DEFAULT 'basic',
+                nickname TEXT
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
@@ -92,6 +98,18 @@ def initialize_database():
                 ON sessions(license_id);
             """
         )
+        license_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(licenses)")
+        }
+        if "last_seen_at" not in license_columns:
+            connection.execute("ALTER TABLE licenses ADD COLUMN last_seen_at REAL")
+        if "tier" not in license_columns:
+            connection.execute(
+                "ALTER TABLE licenses ADD COLUMN tier TEXT NOT NULL DEFAULT 'basic'"
+            )
+        if "nickname" not in license_columns:
+            connection.execute("ALTER TABLE licenses ADD COLUMN nickname TEXT")
 
 
 def _supabase_error(error):
@@ -135,9 +153,27 @@ def _validate_license_id(license_id):
     return normalized
 
 
-def issue_code(expires_days=30):
+def _validate_tier(tier):
+    normalized = str(tier).strip().lower()
+    if normalized not in LICENSE_TIERS:
+        raise ValueError("등급은 basic 또는 premium이어야 합니다.")
+    return normalized
+
+
+def _validate_nickname(nickname):
+    if nickname is None:
+        return None
+    normalized = str(nickname).strip()
+    if not normalized or len(normalized) > MAX_NICKNAME_LENGTH:
+        raise ValueError(f"별명은 1~{MAX_NICKNAME_LENGTH}자로 입력하세요.")
+    return normalized
+
+
+def issue_code(expires_days=30, tier="basic", nickname=None):
     if not 0 <= expires_days <= 365:
         raise ValueError("코드 유효기간은 0(무제한)~365일이어야 합니다.")
+    tier = _validate_tier(tier)
+    nickname = _validate_nickname(nickname)
 
     code = _new_code()
     license_id = secrets.token_hex(8).upper()
@@ -151,6 +187,8 @@ def issue_code(expires_days=30):
                     "p_license_id": license_id,
                     "p_code_hash": code_hash,
                     "p_expires_days": expires_days,
+                    "p_tier": tier,
+                    "p_nickname": nickname,
                 },
             ).execute()
         except Exception as error:
@@ -162,9 +200,9 @@ def issue_code(expires_days=30):
         _begin_write(connection)
         _execute(
             connection,
-            "INSERT INTO licenses(license_id, device_id, active, created_at) "
-            "VALUES (?, NULL, 1, ?)",
-            (license_id, now),
+            "INSERT INTO licenses(license_id, device_id, active, created_at, tier, nickname) "
+            "VALUES (?, NULL, 1, ?, ?, ?)",
+            (license_id, now, tier, nickname),
         )
         _execute(
             connection,
@@ -293,9 +331,113 @@ def verify_session(token, device_id):
             """,
             (_sha256(token), device_id, now, device_id),
         ).fetchone()
+        if session is not None:
+            _execute(
+                connection,
+                "UPDATE licenses SET last_seen_at = ? WHERE license_id = ?",
+                (now, session["license_id"]),
+            )
     if session is None:
         return None
     return session["license_id"]
+
+
+def get_license_status(license_id):
+    license_id = _validate_license_id(license_id)
+    if _uses_supabase():
+        try:
+            result = (
+                _get_supabase_client()
+                .table("kuro_auth_licenses_v2")
+                .select("license_id,active,last_seen_at,tier,nickname")
+                .eq("license_id", license_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as error:
+            _supabase_error(error)
+        rows = result.data or []
+        if not rows:
+            raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.")
+        row = rows[0]
+        last_seen = row.get("last_seen_at")
+        if isinstance(last_seen, str):
+            from datetime import datetime
+
+            last_seen = datetime.fromisoformat(
+                last_seen.replace("Z", "+00:00")
+            ).timestamp()
+    else:
+        with _connection() as connection:
+            row = _execute(
+                connection,
+                "SELECT license_id, active, last_seen_at, tier, nickname FROM licenses WHERE license_id = ?",
+                (license_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.")
+        last_seen = row["last_seen_at"]
+
+    active = bool(row["active"])
+    last_seen = float(last_seen) if last_seen is not None else None
+    return {
+        "license_id": license_id,
+        "active": active,
+        "last_seen_at": last_seen,
+        "tier": _validate_tier(row["tier"]),
+        "nickname": row["nickname"],
+        "online": bool(
+            active
+            and last_seen is not None
+            and time.time() - last_seen <= ONLINE_WINDOW_SECONDS
+        ),
+    }
+
+
+def set_license_tier(license_id, tier):
+    license_id = _validate_license_id(license_id)
+    tier = _validate_tier(tier)
+    if _uses_supabase():
+        try:
+            _get_supabase_client().table("kuro_auth_licenses_v2").update(
+                {"tier": tier}
+            ).eq("license_id", license_id).execute()
+        except Exception as error:
+            _supabase_error(error)
+    else:
+        with _connection() as connection:
+            updated = _execute(
+                connection,
+                "UPDATE licenses SET tier = ? WHERE license_id = ?",
+                (tier, license_id),
+            )
+        if updated.rowcount == 0:
+            raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.")
+    return get_license_status(license_id)
+
+
+def set_license_nickname(license_id, nickname):
+    license_id = _validate_license_id(license_id)
+    nickname = _validate_nickname(nickname)
+    if nickname is None:
+        raise ValueError(f"별명은 1~{MAX_NICKNAME_LENGTH}자로 입력하세요.")
+    if _uses_supabase():
+        try:
+            _get_supabase_client().table("kuro_auth_licenses_v2").update(
+                {"nickname": nickname}
+            ).eq("license_id", license_id).execute()
+        except Exception as error:
+            _supabase_error(error)
+    else:
+        with _connection() as connection:
+            updated = _execute(
+                connection,
+                "UPDATE licenses SET nickname = ? WHERE license_id = ?",
+                (nickname, license_id),
+            )
+        if updated.rowcount == 0:
+            raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.")
+    return get_license_status(license_id)
 
 
 def reset_device(license_id, expires_days=30):
@@ -329,7 +471,11 @@ def reset_device(license_id, expires_days=30):
             raise ValueError("관리 ID를 찾을 수 없습니다. 발급 메시지의 ID를 확인하세요.")
         if not license_row["active"]:
             raise PermissionError("이미 취소된 인증입니다. 새 코드를 발급하세요.")
-        _execute(connection, "UPDATE licenses SET device_id = NULL WHERE license_id = ?", (license_id,))
+        _execute(
+            connection,
+            "UPDATE licenses SET device_id = NULL, last_seen_at = NULL WHERE license_id = ?",
+            (license_id,),
+        )
         _execute(
             connection,
             "DELETE FROM sessions WHERE license_id = ?",

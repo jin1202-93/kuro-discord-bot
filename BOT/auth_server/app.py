@@ -7,7 +7,12 @@ from collections import defaultdict, deque
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from auth_server.database import initialize_database, redeem_code, verify_session
+from auth_server.database import (
+    get_license_status,
+    initialize_database,
+    redeem_code,
+    verify_session,
+)
 
 
 app = FastAPI(title="KURO HELPER Authentication API", docs_url=None, redoc_url=None)
@@ -71,7 +76,11 @@ def redeem(request: RedeemRequest):
         raise HTTPException(status_code=401, detail=str(error)) from error
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
-    return {"access_token": token}
+    license_id = verify_session(token, request.device_id)
+    if license_id is None:
+        raise HTTPException(status_code=401, detail="인증 코드를 확인할 수 없습니다.")
+    status = get_license_status(license_id)
+    return {"access_token": token, "tier": status["tier"]}
 
 
 @app.post("/v1/auth/verify")
@@ -87,4 +96,9 @@ def verify(request: VerifyRequest, authorization: str | None = Header(default=No
             status_code=401,
             detail="인증이 만료되었거나 권한이 취소되었습니다. 디스코드에서 다시 인증하세요.",
         )
-    return {"authorized": True, "license_id": license_id}
+    status = get_license_status(license_id)
+    return {
+        "authorized": True,
+        "license_id": license_id,
+        "tier": status["tier"],
+    }

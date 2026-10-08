@@ -9,7 +9,10 @@ CREATE TABLE IF NOT EXISTS public.kuro_auth_licenses_v2 (
     license_id text PRIMARY KEY,
     device_id text,
     active boolean NOT NULL DEFAULT true,
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at timestamptz,
+    tier text NOT NULL DEFAULT 'basic',
+    nickname text
 );
 
 CREATE TABLE IF NOT EXISTS public.kuro_auth_sessions_v2 (
@@ -21,6 +24,11 @@ CREATE TABLE IF NOT EXISTS public.kuro_auth_sessions_v2 (
 
 ALTER TABLE public.kuro_auth_codes_v2 ALTER COLUMN expires_at DROP NOT NULL;
 ALTER TABLE public.kuro_auth_sessions_v2 ALTER COLUMN expires_at DROP NOT NULL;
+ALTER TABLE public.kuro_auth_licenses_v2 ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
+ALTER TABLE public.kuro_auth_licenses_v2
+    ADD COLUMN IF NOT EXISTS tier text NOT NULL DEFAULT 'basic';
+ALTER TABLE public.kuro_auth_licenses_v2
+    ADD COLUMN IF NOT EXISTS nickname text;
 
 CREATE INDEX IF NOT EXISTS kuro_auth_sessions_v2_license_idx
     ON public.kuro_auth_sessions_v2(license_id);
@@ -34,10 +42,15 @@ REVOKE ALL ON public.kuro_auth_codes_v2, public.kuro_auth_licenses_v2, public.ku
 GRANT ALL ON public.kuro_auth_codes_v2, public.kuro_auth_licenses_v2, public.kuro_auth_sessions_v2
     TO service_role;
 
+DROP FUNCTION IF EXISTS public.issue_auth_code_v2(text, text, integer);
+DROP FUNCTION IF EXISTS public.issue_auth_code_v2(text, text, integer, text);
+
 CREATE OR REPLACE FUNCTION public.issue_auth_code_v2(
     p_license_id text,
     p_code_hash text,
-    p_expires_days integer
+    p_expires_days integer,
+    p_tier text,
+    p_nickname text
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -48,9 +61,15 @@ BEGIN
     IF p_expires_days < 0 OR p_expires_days > 365 THEN
         RAISE EXCEPTION 'AUTH_INVALID_EXPIRY';
     END IF;
+    IF p_tier NOT IN ('basic', 'premium') THEN
+        RAISE EXCEPTION 'AUTH_INVALID_TIER';
+    END IF;
+    IF p_nickname IS NOT NULL AND length(btrim(p_nickname)) NOT BETWEEN 1 AND 32 THEN
+        RAISE EXCEPTION 'AUTH_INVALID_NICKNAME';
+    END IF;
 
-    INSERT INTO public.kuro_auth_licenses_v2(license_id)
-    VALUES (p_license_id);
+    INSERT INTO public.kuro_auth_licenses_v2(license_id, tier, nickname)
+    VALUES (p_license_id, p_tier, NULLIF(btrim(p_nickname), ''));
 
     INSERT INTO public.kuro_auth_codes_v2(code_hash, license_id, expires_at)
     VALUES (
@@ -132,12 +151,14 @@ CREATE OR REPLACE FUNCTION public.verify_auth_session_v2(
     p_device_id text
 )
 RETURNS text
-LANGUAGE sql
-STABLE
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
 AS $$
-    SELECT s.license_id
+DECLARE
+        v_license_id text;
+BEGIN
+        SELECT s.license_id INTO v_license_id
     FROM public.kuro_auth_sessions_v2 AS s
     JOIN public.kuro_auth_licenses_v2 AS l USING (license_id)
     WHERE s.token_hash = p_token_hash
@@ -145,6 +166,21 @@ AS $$
     AND (s.expires_at IS NULL OR s.expires_at > now())
       AND l.device_id = p_device_id
       AND l.active;
+        IF v_license_id IS NULL THEN
+                RETURN NULL;
+        END IF;
+
+        UPDATE public.kuro_auth_licenses_v2
+        SET last_seen_at = now()
+        WHERE license_id = v_license_id
+            AND device_id = p_device_id
+            AND active;
+        IF NOT FOUND THEN
+                RETURN NULL;
+        END IF;
+
+        RETURN v_license_id;
+END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.reset_auth_device_v2(
@@ -162,7 +198,7 @@ BEGIN
         RAISE EXCEPTION 'AUTH_INVALID_EXPIRY';
     END IF;
 
-    UPDATE public.kuro_auth_licenses_v2 SET device_id = NULL
+    UPDATE public.kuro_auth_licenses_v2 SET device_id = NULL, last_seen_at = NULL
     WHERE license_id = p_license_id AND active;
     IF NOT FOUND THEN
         IF EXISTS (SELECT 1 FROM public.kuro_auth_licenses_v2 WHERE license_id = p_license_id) THEN
@@ -202,7 +238,7 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.issue_auth_code_v2(text, text, integer)
+REVOKE ALL ON FUNCTION public.issue_auth_code_v2(text, text, integer, text, text)
     FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.redeem_auth_code_v2(text, text, text)
     FROM PUBLIC, anon, authenticated;
@@ -213,7 +249,7 @@ REVOKE ALL ON FUNCTION public.reset_auth_device_v2(text, text, integer)
 REVOKE ALL ON FUNCTION public.revoke_auth_user_v2(text)
     FROM PUBLIC, anon, authenticated;
 
-GRANT EXECUTE ON FUNCTION public.issue_auth_code_v2(text, text, integer)
+GRANT EXECUTE ON FUNCTION public.issue_auth_code_v2(text, text, integer, text, text)
     TO service_role;
 GRANT EXECUTE ON FUNCTION public.redeem_auth_code_v2(text, text, text)
     TO service_role;
