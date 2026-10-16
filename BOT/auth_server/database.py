@@ -11,7 +11,7 @@ from cryptography.fernet import Fernet, InvalidToken
 DEFAULT_DATABASE = Path(__file__).resolve().parent / "auth.sqlite3"
 SESSION_DAYS = 30
 ONLINE_WINDOW_SECONDS = 90
-LICENSE_TIERS = frozenset(("basic", "premium"))
+LICENSE_TIERS = frozenset(("basic", "premium", "developer"))
 MAX_NICKNAME_LENGTH = 32
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LICENSE_ID_PATTERN = re.compile(r"[A-F0-9]{16}")
@@ -238,7 +238,7 @@ def resolve_license_id(license_id_or_nickname):
 def _validate_tier(tier):
     normalized = str(tier).strip().lower()
     if normalized not in LICENSE_TIERS:
-        raise ValueError("등급은 basic 또는 premium이어야 합니다.")
+        raise ValueError("등급은 basic, premium 또는 developer이어야 합니다.")
     return normalized
 
 
