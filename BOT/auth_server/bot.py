@@ -53,7 +53,7 @@ def _expiry_text(expires_days):
 
 
 def _tier_text(tier):
-    return "프리미엄" if tier == "premium" else "기본"
+    return {"developer": "개발용", "premium": "프리미엄"}.get(tier, "기본")
 
 
 def create_bot():
@@ -102,6 +102,7 @@ def create_bot():
         tier=[
             app_commands.Choice(name="기본", value="basic"),
             app_commands.Choice(name="프리미엄", value="premium"),
+            app_commands.Choice(name="개발용", value="developer"),
         ]
     )
     async def issuecode(
@@ -401,6 +402,7 @@ def create_bot():
         tier=[
             app_commands.Choice(name="기본", value="basic"),
             app_commands.Choice(name="프리미엄", value="premium"),
+            app_commands.Choice(name="개발용", value="developer"),
         ]
     )
     async def settier(
